@@ -31,28 +31,93 @@ ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
 </head>
 "#;
 
+/// Keeps the list in sync with the Sender. Download links work without it.
+const SCRIPT: &str = r#"<script>
+(() => {
+  const list = document.getElementById("items");
+  const status = document.getElementById("status");
+  const span = (cls, text) => {
+    const el = document.createElement("span");
+    el.className = cls;
+    el.textContent = text;
+    return el;
+  };
+  const events = new EventSource("events");
+  events.addEventListener("transfer", (message) => {
+    const { items } = JSON.parse(message.data);
+    list.replaceChildren(...items.map((item) => {
+      const link = document.createElement("a");
+      link.className = "item";
+      link.href = "items/" + item.id;
+      link.download = item.name;
+      link.append(span("name", item.name), span("size", item.size), span("get", "Download"));
+      const li = document.createElement("li");
+      li.append(link);
+      return li;
+    }));
+    status.className = items.length ? "hint" : "empty";
+    status.textContent = items.length ? __HINT__ : __EMPTY__;
+  });
+})();
+</script>"#;
+
+const HINT: &str = "Tap a file to download it.";
+const EMPTY: &str = "Nothing here yet. Add files on your computer.";
+
+/// What the Receiver sees of the Transfer; sent as JSON in `transfer` events.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ReceiverView {
+    items: Vec<ReceiverItem>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct ReceiverItem {
+    id: String,
+    name: String,
+    size: String,
+}
+
+impl ReceiverView {
+    pub(crate) fn new(items: &[Item]) -> Self {
+        Self {
+            items: items
+                .iter()
+                .map(|item| ReceiverItem {
+                    id: item.id.to_string(),
+                    name: item.name.clone(),
+                    size: format_size(item.size),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Renders the full page for the open Transfer's Items.
 pub(crate) fn render(items: &[Item]) -> String {
     let body = dioxus_ssr::render_element(rsx! {
         main {
             h1 { "Oxdrop" }
             if items.is_empty() {
-                p { class: "empty", "Nothing here yet. Add files on your computer." }
+                p { id: "status", class: "empty", "{EMPTY}" }
             } else {
-                p { class: "hint", "Tap a file to download it." }
-                ul {
-                    for item in items {
-                        li { key: "{item.id}",
-                            a { class: "item", href: "items/{item.id}", download: "{item.name}",
-                                span { class: "name", "{item.name}" }
-                                span { class: "size", "{format_size(item.size)}" }
-                                span { class: "get", "Download" }
-                            }
+                p { id: "status", class: "hint", "{HINT}" }
+            }
+            ul { id: "items",
+                for item in items {
+                    li { key: "{item.id}",
+                        a { class: "item", href: "items/{item.id}", download: "{item.name}",
+                            span { class: "name", "{item.name}" }
+                            span { class: "size", "{format_size(item.size)}" }
+                            span { class: "get", "Download" }
                         }
                     }
                 }
             }
         }
     });
-    format!("{HEAD}<body>{body}</body>\n</html>\n")
+    let js_string = |text: &str| serde_json::to_string(text).expect("strings serialize");
+    let script = SCRIPT
+        .replace("__HINT__", &js_string(HINT))
+        .replace("__EMPTY__", &js_string(EMPTY));
+    format!("{HEAD}<body>{body}{script}</body>\n</html>\n")
 }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::TransferSecret;
+use crate::names::unique_name;
 
 /// Identifies an Item within its Transfer. Opaque to the Receiver; stable while the Transfer is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,6 +20,22 @@ impl FromStr for ItemId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         s.parse().map(ItemId)
+    }
+}
+
+/// What adding a path did to the Transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Added {
+    New(ItemId),
+    /// The path was already an Item; nothing changed.
+    AlreadyPresent(ItemId),
+}
+
+impl Added {
+    pub fn id(self) -> ItemId {
+        match self {
+            Added::New(id) | Added::AlreadyPresent(id) => id,
+        }
     }
 }
 
@@ -75,8 +92,16 @@ impl Transfer {
         self.items.iter().find(|item| item.id == id)
     }
 
-    /// Adds the file at `path` as a new Item.
-    pub fn add_path(&mut self, path: &Path) -> Result<ItemId, AddError> {
+    /// Adds the file at `path` as a new Item with a unique Item Name.
+    /// Adding a path that is already an Item changes nothing.
+    pub fn add_path(&mut self, path: &Path) -> Result<Added, AddError> {
+        let path = &std::path::absolute(path).map_err(|source| AddError::Unreadable {
+            path: path.to_owned(),
+            source,
+        })?;
+        if let Some(existing) = self.items.iter().find(|item| item.path == *path) {
+            return Ok(Added::AlreadyPresent(existing.id));
+        }
         let metadata = std::fs::metadata(path).map_err(|source| AddError::Unreadable {
             path: path.to_owned(),
             source,
@@ -86,14 +111,15 @@ impl Transfer {
                 path: path.to_owned(),
             });
         }
-        let name = match path.file_name() {
-            Some(name) if metadata.is_file() => name.to_string_lossy().into_owned(),
+        let file_name = match path.file_name() {
+            Some(name) if metadata.is_file() => name.to_string_lossy(),
             _ => {
                 return Err(AddError::NotAFile {
                     path: path.to_owned(),
                 });
             }
         };
+        let name = unique_name(&file_name, self.items.iter().map(|item| item.name.as_str()));
         let id = ItemId(self.next_id);
         self.next_id += 1;
         self.items.push(Item {
@@ -102,7 +128,14 @@ impl Transfer {
             path: path.to_owned(),
             size: metadata.len(),
         });
-        Ok(id)
+        Ok(Added::New(id))
+    }
+
+    /// Removes an Item, freeing its Item Name. Returns whether it was there.
+    pub fn remove(&mut self, id: ItemId) -> bool {
+        let before = self.items.len();
+        self.items.retain(|item| item.id != id);
+        self.items.len() != before
     }
 }
 
@@ -117,7 +150,7 @@ mod tests {
         std::fs::write(&path, b"hello").unwrap();
         let mut transfer = Transfer::open();
 
-        let id = transfer.add_path(&path).unwrap();
+        let id = transfer.add_path(&path).unwrap().id();
 
         let item = transfer.item(id).unwrap();
         assert_eq!(item.name, "notes.txt");
@@ -134,7 +167,7 @@ mod tests {
             .map(|n| {
                 let p = dir.path().join(n);
                 std::fs::write(&p, b"x").unwrap();
-                transfer.add_path(&p).unwrap()
+                transfer.add_path(&p).unwrap().id()
             })
             .collect();
 
