@@ -1,0 +1,17 @@
+[package]
+name = "oxdrop-desktop"
+description = "Oxdrop desktop app (the Sender)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxdrop"
+path = "src/main.rs"
+
+[dependencies]
+oxdrop-core.workspace = true
+oxdrop-server.workspace = true
+dioxus = { workspace = true, features = ["desktop"] }
+qrcode.workspace = true
