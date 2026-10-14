@@ -1,0 +1,16 @@
+[package]
+name = "oxdrop-core"
+description = "Oxdrop domain: Transfers, Items and Transfer Links"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+getrandom.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

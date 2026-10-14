@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/oxdrop-core", "crates/oxdrop-server", "crates/oxdrop-desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tungdevpro/oxdrop"
+
+[workspace.dependencies]
+oxdrop-core = { path = "crates/oxdrop-core" }
+oxdrop-server = { path = "crates/oxdrop-server" }
+axum = "0.8.9"
+base64 = "0.23.1"
+dioxus = "0.7.10"
+dioxus-ssr = "0.7.10"
+getrandom = "0.4.3"
+if-addrs = "0.15.0"
+percent-encoding = "2.3.2"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+reqwest = { version = "0.13.5", default-features = false }
+subtle = "2.6.1"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = "1.53.3"
+tokio-util = "0.7.20"
+tracing = "0.1.44"
