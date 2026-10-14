@@ -3,12 +3,13 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 use dioxus::html::HasFileData;
 use dioxus::prelude::*;
-use oxdrop_core::format_size;
+use oxdrop_core::{Item, format_size};
 use oxdrop_server::{EngineConfig, SenderEngine};
 use qrcode::QrCode;
 use qrcode::render::svg;
@@ -34,6 +35,16 @@ li { display: flex; gap: 12px; padding: 12px 14px; background: var(--card); bord
 .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
 .size { color: var(--muted); white-space: nowrap; }
 .problem { margin: 0; color: var(--problem); white-space: pre-line; }
+.toolbar { display: flex; justify-content: flex-end; }
+.button { display: inline-block; padding: 7px 14px; border-radius: 8px; background: var(--accent); color: #fff; font-weight: 600; cursor: default; }
+.button:active { opacity: .85; }
+.remove { flex: none; width: 24px; height: 24px; padding: 0; border: none; border-radius: 6px; background: transparent; color: var(--muted); font-size: 18px; line-height: 24px; }
+.remove:hover { background: var(--line); color: var(--text); }
+li { align-items: center; }
+.status { display: flex; align-items: center; gap: 8px; margin: 6px 0 0; color: var(--muted); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
+.status.connected { color: var(--text); }
+.status.connected .dot { background: #12b76a; }
 .failed { margin: auto; max-width: 420px; text-align: center; }
 </style>"#;
 
@@ -69,25 +80,46 @@ fn App() -> Element {
         let engine = engine.clone();
         move || engine.state()
     });
+    use_future({
+        let engine = engine.clone();
+        move || {
+            let mut updates = engine.subscribe();
+            async move {
+                // Catch anything that changed before we subscribed, then follow every change.
+                state.set(updates.borrow_and_update().clone());
+                while updates.changed().await.is_ok() {
+                    state.set(updates.borrow_and_update().clone());
+                }
+            }
+        }
+    });
     let mut problem = use_signal(|| None::<String>);
     let mut dragging = use_signal(|| false);
     let link = use_memo(move || state.read().link.to_string());
     let qr = use_memo(move || qr_svg(&link()));
 
-    let add_dropped = move |event: DragEvent| {
-        event.prevent_default();
-        dragging.set(false);
-        let errors: Vec<String> = event
-            .files()
-            .iter()
-            .filter_map(|file| engine.add_path(&file.path()).err())
+    let mut add = move |paths: Vec<PathBuf>| {
+        let errors: Vec<String> = engine
+            .add_paths(&paths)
+            .into_iter()
+            .filter_map(Result::err)
             .map(|error| error.to_string())
             .collect();
         problem.set((!errors.is_empty()).then(|| errors.join("\n")));
-        state.set(engine.state());
     };
+    let add_dropped = {
+        let mut add = add.clone();
+        move |event: DragEvent| {
+            event.prevent_default();
+            dragging.set(false);
+            add(event.files().iter().map(|file| file.path()).collect());
+        }
+    };
+    let add_picked =
+        move |event: FormEvent| add(event.files().iter().map(|file| file.path()).collect());
 
     let items = state.read().items.clone();
+    let connected = state.read().receiver_connected;
     rsx! {
         div {
             class: if dragging() { "app dragging" } else { "app" },
@@ -101,15 +133,27 @@ fn App() -> Element {
                 div { class: "qr", dangerous_inner_html: "{qr}" }
                 p { class: "scan", "Scan with your Android phone" }
                 p { class: "link", "{link}" }
+                p { class: if connected { "status connected" } else { "status" },
+                    span { class: "dot" }
+                    if connected { "Phone connected" } else { "Waiting for phone…" }
+                }
             }
             section { class: "items",
+                div { class: "toolbar",
+                    label { class: "button",
+                        "Add files…"
+                        input {
+                            r#type: "file",
+                            multiple: true,
+                            hidden: true,
+                            onchange: add_picked,
+                        }
+                    }
+                }
                 if !items.is_empty() {
                     ul {
                         for item in items {
-                            li { key: "{item.id}",
-                                span { class: "name", title: "{item.path.display()}", "{item.name}" }
-                                span { class: "size", "{format_size(item.size)}" }
-                            }
+                            ItemRow { key: "{item.id}", item }
                         }
                     }
                 }
@@ -119,6 +163,26 @@ fn App() -> Element {
                 if let Some(problem) = problem() {
                     p { class: "problem", "{problem}" }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn ItemRow(item: Item) -> Element {
+    let Engine(engine) = use_context::<Engine>();
+    let id = item.id;
+    rsx! {
+        li {
+            span { class: "name", title: "{item.path.display()}", "{item.name}" }
+            span { class: "size", "{format_size(item.size)}" }
+            button {
+                class: "remove",
+                title: "Remove",
+                onclick: move |_| {
+                    engine.remove_item(id);
+                },
+                "×"
             }
         }
     }

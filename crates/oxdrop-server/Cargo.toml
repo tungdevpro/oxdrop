@@ -11,15 +11,20 @@ oxdrop-core.workspace = true
 axum.workspace = true
 dioxus = { workspace = true, default-features = false, features = ["macro", "html", "signals", "hooks"] }
 dioxus-ssr.workspace = true
+futures-util.workspace = true
 if-addrs.workspace = true
 percent-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "fs", "sync", "macros"] }
-tokio-util = { workspace = true, features = ["io"] }
+tokio-stream.workspace = true
+tokio-util = { workspace = true, features = ["io", "rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
 percent-encoding.workspace = true
 reqwest = { workspace = true }
+serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
