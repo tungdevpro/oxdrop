@@ -11,6 +11,7 @@ use oxdrop_core::{AddError, Added, Item, ItemId, ItemStatus, Transfer, TransferL
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::zip_stream::CrcCache;
 use crate::{http, network};
 
 /// How often the Sender rechecks Items' files, so Changed and Missing show up
@@ -73,27 +74,12 @@ pub(crate) struct Live {
 }
 
 impl Live {
-    /// Rechecks an Item's file against its snapshot. Returns its status and whether
-    /// that differs from what was recorded before, or `None` if there's no such Item.
-    fn check(&mut self, id: ItemId) -> Option<(ItemStatus, bool)> {
-        let before = self.transfer.item(id)?.status;
-        let after = self.transfer.check(id)?;
-        Some((after, after != before))
-    }
-
-    /// The Item to serve and a token that is cancelled if the Item is removed or the engine stops.
-    fn start_download(
-        &mut self,
-        id: ItemId,
-        shutdown: &CancellationToken,
-    ) -> Result<(Item, CancellationToken), Refusal> {
-        let item = self.transfer.item(id).ok_or(Refusal::NoSuchItem)?.clone();
-        let token = self
-            .downloads
+    /// A token that is cancelled if the Item is removed or refreshed, or the engine stops.
+    fn download_token(&mut self, id: ItemId, shutdown: &CancellationToken) -> CancellationToken {
+        self.downloads
             .entry(id)
             .or_insert_with(|| shutdown.child_token())
-            .clone();
-        Ok((item, token))
+            .clone()
     }
 
     /// Aborts the Item's in-flight downloads.
@@ -117,6 +103,7 @@ pub(crate) struct Shared {
     updates: watch::Sender<TransferState>,
     receivers: AtomicUsize,
     pub(crate) shutdown: CancellationToken,
+    pub(crate) crcs: Arc<CrcCache>,
 }
 
 impl Shared {
@@ -151,38 +138,50 @@ impl Shared {
         self.updates.subscribe()
     }
 
-    /// Rechecks every Item's file against its snapshot, telling subscribers if any
-    /// became Changed or Missing (or matches again).
-    fn check_items(&self) {
-        let any_changed = {
+    /// Rechecks `items` against their snapshots and records any status that changed,
+    /// telling subscribers. The files are looked at without holding the `live` lock, so a
+    /// large folder doesn't hold up downloads. Returns each Item's status now.
+    fn check(&self, items: &[Item]) -> Vec<ItemStatus> {
+        let statuses: Vec<ItemStatus> = items.iter().map(Item::current_status).collect();
+        let changed = {
             let mut live = self.live();
-            let ids: Vec<ItemId> = live.transfer.items().iter().map(|item| item.id).collect();
-            ids.into_iter()
-                .filter_map(|id| live.check(id))
-                .fold(false, |any, (_, changed)| any || changed)
+            items
+                .iter()
+                .zip(&statuses)
+                .filter(|(item, status)| item.status != **status)
+                .fold(false, |any, (item, status)| {
+                    live.transfer.set_status(item.id, &item.etag(), *status) || any
+                })
         };
-        if any_changed {
+        if changed {
             self.publish();
         }
+        statuses
     }
 
-    /// Rechecks the Item's file, then hands out what to serve: the Item as snapshotted
-    /// and a token that is cancelled if the Item is removed or the engine stops.
+    /// Rechecks every Item's files against its snapshot, telling subscribers if any
+    /// became Changed or Missing (or matches again).
+    fn check_items(&self) {
+        let items = self.live().transfer.items().to_vec();
+        self.check(&items);
+    }
+
+    /// Rechecks the Item's files, then hands out what to serve: the Item as snapshotted
+    /// and a token that is cancelled if the Item is removed or refreshed, or the engine stops.
     pub(crate) fn start_download(&self, id: ItemId) -> Result<(Item, CancellationToken), Refusal> {
-        let (outcome, status_changed) = {
-            let mut live = self.live();
-            match live.check(id) {
-                None => (Err(Refusal::NoSuchItem), false),
-                Some((ItemStatus::Available, changed)) => {
-                    (live.start_download(id, &self.shutdown), changed)
-                }
-                Some((status, changed)) => (Err(Refusal::Unavailable(status)), changed),
+        let item = self
+            .live()
+            .transfer
+            .item(id)
+            .cloned()
+            .ok_or(Refusal::NoSuchItem)?;
+        match self.check(std::slice::from_ref(&item))[0] {
+            ItemStatus::Available => {
+                let token = self.live().download_token(id, &self.shutdown);
+                Ok((item, token))
             }
-        };
-        if status_changed {
-            self.publish();
+            status => Err(Refusal::Unavailable(status)),
         }
-        outcome
     }
 
     /// Marks a Receiver as connected until the returned guard is dropped.
@@ -302,6 +301,7 @@ impl SenderEngine {
             updates,
             receivers: AtomicUsize::new(0),
             shutdown: CancellationToken::new(),
+            crcs: Arc::default(),
         });
 
         let runtime = tokio::runtime::Builder::new_multi_thread()

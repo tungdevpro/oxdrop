@@ -13,6 +13,7 @@ oxdrop-core = { path = "crates/oxdrop-core" }
 oxdrop-server = { path = "crates/oxdrop-server" }
 axum = "0.8.9"
 base64 = "0.23.1"
+crc32fast = "1.5.2"
 dioxus = { version = "0.7.10", default-features = false }
 dioxus-ssr = "0.7.10"
 futures-util = { version = "0.3.34", default-features = false }
@@ -30,3 +31,8 @@ tokio = "1.53.3"
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"
+zip = { version = "9.0.3", default-features = false }
+
+# CRC-32 runs over every byte of every zipped file; keep it fast in debug builds and tests.
+[profile.dev.package.crc32fast]
+opt-level = 3

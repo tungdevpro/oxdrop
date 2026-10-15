@@ -35,6 +35,11 @@ impl Harness {
         }
     }
 
+    /// The path of `relative` inside the harness's temporary directory.
+    pub fn path(&self, relative: &str) -> PathBuf {
+        self.dir.path().join(relative)
+    }
+
     /// Writes a file into the harness's temporary directory and returns its path.
     pub fn file(&self, name: &str, contents: &[u8]) -> PathBuf {
         let path = self.dir.path().join(name);
