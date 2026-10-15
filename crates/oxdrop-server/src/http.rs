@@ -1,10 +1,12 @@
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
+use axum::extract::{FromRef, Path, Request, State};
 use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -18,13 +20,50 @@ use tokio_util::sync::CancellationToken;
 use crate::engine::Shared;
 use crate::page::{self, ReceiverView};
 
-pub(crate) fn router(shared: Arc<Shared>) -> Router {
+/// What one bound listener serves: the shared Transfer, plus the address it answers
+/// to and the switch that stops it.
+#[derive(Clone)]
+pub(crate) struct Listening {
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) address: SocketAddr,
+    pub(crate) stop: CancellationToken,
+}
+
+impl FromRef<Listening> for Arc<Shared> {
+    fn from_ref(listening: &Listening) -> Self {
+        listening.shared.clone()
+    }
+}
+
+pub(crate) fn router(listening: Listening) -> Router {
     Router::new()
         .route("/t/{secret}", get(add_trailing_slash))
         .route("/t/{secret}/", get(receiver_page))
         .route("/t/{secret}/events", get(events))
         .route("/t/{secret}/items/{item_id}", get(download_item))
-        .with_state(shared)
+        .layer(middleware::from_fn_with_state(
+            listening.clone(),
+            require_bound_host,
+        ))
+        .with_state(listening)
+}
+
+/// Serves only requests addressed to the bound IP literal and port. A page on
+/// some other site that rebinds its own host name to our address can make the
+/// phone's (or this computer's) browser connect to us, but its requests still
+/// carry that host name, so they're turned away here.
+async fn require_bound_host(
+    State(listening): State<Listening>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let expected = listening.address.to_string();
+    let host = request.headers().get(header::HOST);
+    if host.is_some_and(|host| host.as_bytes() == expected.as_bytes()) {
+        next.run(request).await
+    } else {
+        StatusCode::MISDIRECTED_REQUEST.into_response()
+    }
 }
 
 /// Rejects anything not carrying the open Transfer's secret with a plain 404,
@@ -58,7 +97,7 @@ async fn receiver_page(
 /// current view first, then a new one whenever it changes. An open stream is what
 /// "Receiver connected" means.
 async fn events(
-    State(shared): State<Arc<Shared>>,
+    State(Listening { shared, stop, .. }): State<Listening>,
     Path(secret): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
     check_secret(&shared, &secret)?;
@@ -75,12 +114,12 @@ async fn events(
             });
             std::future::ready(event)
         })
-        .take_until(shared.shutdown.clone().cancelled_owned());
+        .take_until(stop.cancelled_owned());
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 async fn download_item(
-    State(shared): State<Arc<Shared>>,
+    State(Listening { shared, stop, .. }): State<Listening>,
     Path((secret, item_id)): Path<(String, String)>,
 ) -> Result<Response, StatusCode> {
     check_secret(&shared, &secret)?;
@@ -107,26 +146,30 @@ async fn download_item(
             (header::CONTENT_LENGTH, length.to_string()),
             (header::CONTENT_DISPOSITION, content_disposition(&item.name)),
         ],
-        Body::from_stream(abortable(ReaderStream::new(file), cancelled)),
+        Body::from_stream(abortable(ReaderStream::new(file), cancelled, stop)),
     )
         .into_response())
 }
 
-/// Passes `chunks` through until `cancelled` fires, then fails the stream so the
-/// connection is cut and the Receiver's browser marks the download as failed,
-/// rather than ending early as if it were complete.
+/// Passes `chunks` through until the Item is withdrawn (`withdrawn`) or this listener
+/// stops (`stop`), then fails the stream so the connection is cut and the Receiver's
+/// browser marks the download as failed, rather than ending early as if it were complete.
 fn abortable(
     chunks: ReaderStream<tokio::fs::File>,
-    cancelled: CancellationToken,
+    withdrawn: CancellationToken,
+    stop: CancellationToken,
 ) -> impl Stream<Item = std::io::Result<Bytes>> {
-    futures_util::stream::unfold(Some((chunks, cancelled)), |state| async move {
-        let (mut chunks, cancelled) = state?;
+    futures_util::stream::unfold(Some((chunks, withdrawn, stop)), |state| async move {
+        let (mut chunks, withdrawn, stop) = state?;
         tokio::select! {
             biased;
-            () = cancelled.cancelled() => {
+            () = withdrawn.cancelled() => {
                 Some((Err(std::io::Error::other("Item is no longer offered")), None))
             }
-            chunk = chunks.next() => chunk.map(|chunk| (chunk, Some((chunks, cancelled)))),
+            () = stop.cancelled() => {
+                Some((Err(std::io::Error::other("the Sender stopped listening here")), None))
+            }
+            chunk = chunks.next() => chunk.map(|chunk| (chunk, Some((chunks, withdrawn, stop)))),
         }
     })
 }

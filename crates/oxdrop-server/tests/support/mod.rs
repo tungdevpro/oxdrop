@@ -18,12 +18,16 @@ pub struct Harness {
 }
 
 impl Harness {
+    /// A Sender on IPv4 loopback with an OS-assigned port.
     pub fn new() -> Self {
-        let engine = SenderEngine::start(EngineConfig {
+        Self::start(EngineConfig {
             bind: BindAddress::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             port: 0,
         })
-        .expect("engine starts on loopback");
+    }
+
+    pub fn start(config: EngineConfig) -> Self {
+        let engine = SenderEngine::start(config).expect("engine starts");
         Self {
             engine,
             client: reqwest::Client::new(),

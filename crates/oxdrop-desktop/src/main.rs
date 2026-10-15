@@ -3,6 +3,7 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 use dioxus::html::HasFileData;
 use dioxus::prelude::*;
 use oxdrop_core::{Item, format_size};
-use oxdrop_server::{EngineConfig, SenderEngine};
+use oxdrop_server::{EngineConfig, SenderEngine, interface_candidates};
 use qrcode::QrCode;
 use qrcode::render::svg;
 
@@ -46,6 +47,8 @@ li { align-items: center; }
 .status.connected { color: var(--text); }
 .status.connected .dot { background: #12b76a; }
 .failed { margin: auto; max-width: 420px; text-align: center; }
+.interface { display: flex; align-items: center; gap: 8px; width: 100%; color: var(--muted); font-size: 12px; }
+.interface select { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
 </style>"#;
 
 #[derive(Clone)]
@@ -133,6 +136,7 @@ fn App() -> Element {
                 div { class: "qr", dangerous_inner_html: "{qr}" }
                 p { class: "scan", "Scan with your Android phone" }
                 p { class: "link", "{link}" }
+                InterfacePicker { current: state.read().link.address.ip(), problem }
                 p { class: if connected { "status connected" } else { "status" },
                     span { class: "dot" }
                     if connected { "Phone connected" } else { "Waiting for phone…" }
@@ -183,6 +187,41 @@ fn ItemRow(item: Item) -> Element {
                     engine.remove_item(id);
                 },
                 "×"
+            }
+        }
+    }
+}
+
+/// Lets the user move the Transfer Link to another interface when the automatic
+/// choice isn't one the phone can reach (VPN, Docker, a second adapter).
+#[component]
+fn InterfacePicker(current: IpAddr, problem: Signal<Option<String>>) -> Element {
+    let Engine(engine) = use_context::<Engine>();
+    // Refreshed on focus, so adapters that came up since launch appear.
+    let mut candidates = use_signal(interface_candidates);
+    let mut options: Vec<(String, IpAddr)> = candidates
+        .read()
+        .iter()
+        .map(|c| (format!("{} ({})", c.interface, c.ip), IpAddr::V4(c.ip)))
+        .collect();
+    if !options.iter().any(|(_, ip)| *ip == current) {
+        options.insert(0, (current.to_string(), current));
+    }
+    rsx! {
+        label { class: "interface",
+            "Network"
+            select {
+                onfocus: move |_| candidates.set(interface_candidates()),
+                onchange: move |event| {
+                    let Ok(ip) = event.value().parse::<IpAddr>() else { return };
+                    match engine.switch_interface(ip) {
+                        Ok(()) => problem.set(None),
+                        Err(error) => problem.set(Some(error.to_string())),
+                    }
+                },
+                for (label, ip) in options {
+                    option { value: "{ip}", selected: ip == current, "{label}" }
+                }
             }
         }
     }

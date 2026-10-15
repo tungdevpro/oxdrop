@@ -7,3 +7,5 @@ mod network;
 mod page;
 
 pub use engine::{BindAddress, EngineConfig, SenderEngine, StartError, TransferState};
+pub use network::interface_candidates;
+pub use oxdrop_core::Candidate;
