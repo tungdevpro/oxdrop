@@ -1,7 +1,7 @@
 //! The Receiver page: server-rendered HTML that works in any Android browser.
 
 use dioxus::prelude::*;
-use oxdrop_core::{Item, ItemStatus, format_size};
+use oxdrop_core::{Item, ItemKind, ItemStatus, format_size};
 
 const HEAD: &str = r#"<!doctype html>
 <html lang="en">
@@ -27,6 +27,7 @@ ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
 .size { color: var(--muted); font-size: 14px; white-space: nowrap; }
 .get { color: var(--accent); font-weight: 600; font-size: 14px; }
 .unavailable { flex-wrap: wrap; opacity: .6; }
+.kind { color: var(--muted); font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
 .note { flex-basis: 100%; color: var(--muted); font-size: 14px; }
 .empty { color: var(--muted); padding: 32px 0; text-align: center; }
 </style>
@@ -57,8 +58,10 @@ const SCRIPT: &str = r#"<script>
         row = document.createElement("a");
         row.className = "item";
         row.href = "items/" + item.id;
-        row.download = item.name;
-        row.append(span("name", item.name), span("size", item.size), span("get", "Download"));
+        row.download = item.download;
+        row.append(span("name", item.name));
+        if (item.kind === "folder") row.append(span("kind", __FOLDER__));
+        row.append(span("size", item.size), span("get", "Download"));
       }
       const li = document.createElement("li");
       li.append(row);
@@ -72,6 +75,8 @@ const SCRIPT: &str = r#"<script>
 
 const HINT: &str = "Tap a file to download it.";
 const EMPTY: &str = "Nothing here yet. Add files on your computer.";
+/// Marks a folder Item, which downloads as a zip.
+const FOLDER: &str = "Folder · zip";
 
 /// What the Receiver sees of the Transfer; sent as JSON in `transfer` events.
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
@@ -83,6 +88,10 @@ pub(crate) struct ReceiverView {
 struct ReceiverItem {
     id: String,
     name: String,
+    /// `file` or `folder`.
+    kind: &'static str,
+    /// What the browser saves it as: a folder arrives as `<name>.zip`.
+    download: String,
     size: String,
     /// `available`, `changed` or `missing`.
     status: &'static str,
@@ -115,6 +124,11 @@ impl ReceiverView {
                 .map(|item| ReceiverItem {
                     id: item.id.to_string(),
                     name: item.name.clone(),
+                    kind: match item.kind {
+                        ItemKind::File => "file",
+                        ItemKind::Folder(_) => "folder",
+                    },
+                    download: item.download_name(),
                     size: format_size(item.size),
                     status: status_name(item.status),
                     note: unavailable_note(item.status),
@@ -144,8 +158,11 @@ pub(crate) fn render(items: &[Item]) -> String {
                                 span { class: "note", "{note}" }
                             }
                         } else {
-                            a { class: "item", href: "items/{item.id}", download: "{item.name}",
+                            a { class: "item", href: "items/{item.id}", download: "{item.download_name()}",
                                 span { class: "name", "{item.name}" }
+                                if matches!(item.kind, ItemKind::Folder(_)) {
+                                    span { class: "kind", "{FOLDER}" }
+                                }
                                 span { class: "size", "{format_size(item.size)}" }
                                 span { class: "get", "Download" }
                             }
@@ -158,6 +175,7 @@ pub(crate) fn render(items: &[Item]) -> String {
     let js_string = |text: &str| serde_json::to_string(text).expect("strings serialize");
     let script = SCRIPT
         .replace("__HINT__", &js_string(HINT))
-        .replace("__EMPTY__", &js_string(EMPTY));
+        .replace("__EMPTY__", &js_string(EMPTY))
+        .replace("__FOLDER__", &js_string(FOLDER));
     format!("{HEAD}<body>{body}{script}</body>\n</html>\n")
 }

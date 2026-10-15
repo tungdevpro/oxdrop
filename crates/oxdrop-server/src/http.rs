@@ -12,7 +12,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use futures_util::{Stream, StreamExt};
-use oxdrop_core::{Item, ItemId, ItemStatus, android_safe_name};
+use oxdrop_core::{Item, ItemId, ItemKind, ItemStatus, ZipPlan, android_safe_name};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tokio_stream::wrappers::WatchStream;
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::engine::{Refusal, Shared};
 use crate::page::{self, ReceiverView};
 use crate::range::Requested;
+use crate::zip_stream::zip_range;
 
 /// What one bound listener serves: the shared Transfer, plus the address it answers
 /// to and the switch that stops it.
@@ -134,36 +135,66 @@ async fn download_item(
         Err(Refusal::Unavailable(status)) => return Ok(unavailable(status)),
     };
 
+    // A file is served as itself; a folder as a zip laid out from its snapshot.
+    let zip = match &item.kind {
+        ItemKind::File => None,
+        ItemKind::Folder(snapshot) => Some(Arc::new(ZipPlan::for_folder(
+            &item.name,
+            &item.path,
+            item.modified,
+            snapshot,
+        ))),
+    };
+    let (total, content_type) = match &zip {
+        None => (item.size, "application/octet-stream"),
+        Some(plan) => (plan.len(), "application/zip"),
+    };
+
     let etag = item.etag();
-    let (status, start, length) = match Requested::from_headers(&headers, item.size, &etag) {
-        Requested::Full => (StatusCode::OK, 0, item.size),
+    let (status, start, length) = match Requested::from_headers(&headers, total, &etag) {
+        Requested::Full => (StatusCode::OK, 0, total),
         Requested::Partial { start, end } => (StatusCode::PARTIAL_CONTENT, start, end - start + 1),
         Requested::Unsatisfiable => {
             return Ok((
                 StatusCode::RANGE_NOT_SATISFIABLE,
-                [(header::CONTENT_RANGE, format!("bytes */{}", item.size))],
+                [(header::CONTENT_RANGE, format!("bytes */{total}"))],
             )
                 .into_response());
         }
     };
 
-    let file = match tokio::fs::File::open(&item.path).await {
-        Ok(file) => file,
-        Err(error) => {
-            tracing::warn!(%error, item = %item.id, "can't open Item");
-            return Ok(unavailable(ItemStatus::Missing));
+    let bytes: ByteStream = match zip {
+        None => {
+            let file = match tokio::fs::File::open(&item.path).await {
+                Ok(file) => file,
+                Err(error) => {
+                    tracing::warn!(%error, item = %item.id, "can't open Item");
+                    return Ok(unavailable(ItemStatus::Missing));
+                }
+            };
+            let bytes = snapshot_bytes(file, &item, start, length)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Box::pin(bytes)
         }
+        Some(plan) => match zip_range(plan, shared.crcs.clone(), start, start + length).await {
+            Ok(bytes) => Box::pin(bytes),
+            Err(error) => {
+                tracing::warn!(%error, item = %item.id, "folder changed while preparing zip");
+                return Ok(unavailable(ItemStatus::Changed));
+            }
+        },
     };
-    let bytes = snapshot_bytes(file, &item, start, length)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut response = (
         status,
         [
-            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_TYPE, content_type.to_owned()),
             (header::CONTENT_LENGTH, length.to_string()),
-            (header::CONTENT_DISPOSITION, content_disposition(&item.name)),
+            (
+                header::CONTENT_DISPOSITION,
+                content_disposition(&item.download_name()),
+            ),
             (header::ETAG, etag),
             (header::ACCEPT_RANGES, "bytes".to_owned()),
         ],
@@ -171,7 +202,7 @@ async fn download_item(
     )
         .into_response();
     if status == StatusCode::PARTIAL_CONTENT {
-        let range = format!("bytes {start}-{}/{}", start + length - 1, item.size);
+        let range = format!("bytes {start}-{}/{total}", start + length - 1);
         response.headers_mut().insert(
             header::CONTENT_RANGE,
             HeaderValue::from_str(&range).expect("ASCII header value"),
@@ -179,6 +210,9 @@ async fn download_item(
     }
     Ok(response)
 }
+
+/// The body of a download, whichever kind of Item it is.
+type ByteStream = std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 /// Streams `length` bytes of the Item's `file` from `start`. Before the final chunk goes
 /// out, the file is checked against the snapshot again; if it changed, the stream fails

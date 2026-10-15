@@ -6,6 +6,7 @@ mod http;
 mod network;
 mod page;
 mod range;
+mod zip_stream;
 
 pub use engine::{BindAddress, EngineConfig, SenderEngine, StartError, TransferState};
 pub use network::interface_candidates;

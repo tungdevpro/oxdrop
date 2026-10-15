@@ -3,10 +3,12 @@
 /// Extensions treated as one unit when numbering, so `a.tar.gz` becomes `a (2).tar.gz`.
 const DOUBLE_EXTENSIONS: [&str; 5] = [".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lz"];
 
-/// Returns `desired`, or the first `name (n).ext` (n = 2, 3, …) that isn't `taken`.
+/// Returns `desired`, or the first `name (n).ext` (n = 2, 3, …) that isn't `taken`;
+/// a folder has no extension, so it becomes `name (n)`.
 /// Comparison ignores case, because Android's shared storage does.
 pub(crate) fn unique_name<'a>(
     desired: &str,
+    is_folder: bool,
     taken: impl Iterator<Item = &'a str> + Clone,
 ) -> String {
     let is_taken = |candidate: &str| {
@@ -16,7 +18,11 @@ pub(crate) fn unique_name<'a>(
     if !is_taken(desired) {
         return desired.to_owned();
     }
-    let (stem, extension) = split_extension(desired);
+    let (stem, extension) = if is_folder {
+        (desired, "")
+    } else {
+        split_extension(desired)
+    };
     (2..)
         .map(|n| format!("{stem} ({n}){extension}"))
         .find(|candidate| !is_taken(candidate))

@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 oxdrop-core.workspace = true
 axum.workspace = true
+crc32fast.workspace = true
 dioxus = { workspace = true, default-features = false, features = ["macro", "html", "signals", "hooks"] }
 dioxus-ssr.workspace = true
 futures-util.workspace = true
@@ -28,3 +29,4 @@ reqwest = { workspace = true }
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+zip.workspace = true

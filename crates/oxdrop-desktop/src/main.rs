@@ -10,7 +10,7 @@ use std::sync::Arc;
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 use dioxus::html::HasFileData;
 use dioxus::prelude::*;
-use oxdrop_core::{Item, ItemStatus, format_size};
+use oxdrop_core::{Item, ItemKind, ItemStatus, format_size};
 use oxdrop_server::{EngineConfig, SenderEngine, interface_candidates};
 use qrcode::QrCode;
 use qrcode::render::svg;
@@ -36,12 +36,17 @@ li { display: flex; gap: 12px; padding: 12px 14px; background: var(--card); bord
 .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
 .size { color: var(--muted); white-space: nowrap; }
 .problem { margin: 0; color: var(--problem); white-space: pre-line; }
-.toolbar { display: flex; justify-content: flex-end; }
+.toolbar { display: flex; justify-content: flex-end; gap: 8px; }
 .button { display: inline-block; padding: 7px 14px; border-radius: 8px; background: var(--accent); color: #fff; font-weight: 600; cursor: default; }
 .button:active { opacity: .85; }
 .remove { flex: none; width: 24px; height: 24px; padding: 0; border: none; border-radius: 6px; background: transparent; color: var(--muted); font-size: 18px; line-height: 24px; }
 .remove:hover { background: var(--line); color: var(--text); }
-li { align-items: center; }
+li { align-items: center; flex-wrap: wrap; }
+.kind { flex: none; padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 12px; }
+.skipped { flex-basis: 100%; color: var(--muted); font-size: 12px; }
+.skipped summary { cursor: default; }
+.skipped ul { display: block; margin: 4px 0 0 16px; }
+.skipped li { display: list-item; padding: 0; border: none; background: none; list-style: disc; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
 .status { display: flex; align-items: center; gap: 8px; margin: 6px 0 0; color: var(--muted); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
 .status.connected { color: var(--text); }
@@ -122,7 +127,11 @@ fn App() -> Element {
             add(event.files().iter().map(|file| file.path()).collect());
         }
     };
-    let add_picked =
+    let add_picked = {
+        let mut add = add.clone();
+        move |event: FormEvent| add(event.files().iter().map(|file| file.path()).collect())
+    };
+    let add_picked_folders =
         move |event: FormEvent| add(event.files().iter().map(|file| file.path()).collect());
 
     let items = state.read().items.clone();
@@ -157,6 +166,17 @@ fn App() -> Element {
                             onchange: add_picked,
                         }
                     }
+                    label { class: "button",
+                        "Add folder…"
+                        input {
+                            r#type: "file",
+                            // Dioxus desktop opens a folder picker for this attribute.
+                            directory: true,
+                            multiple: true,
+                            hidden: true,
+                            onchange: add_picked_folders,
+                        }
+                    }
                 }
                 if !items.is_empty() {
                     ul {
@@ -166,7 +186,11 @@ fn App() -> Element {
                     }
                 }
                 div { class: "drop",
-                    if state.read().items.is_empty() { "Drop files here to send them to your phone" } else { "Drop more files here" }
+                    if state.read().items.is_empty() {
+                        "Drop files or folders here to send them to your phone"
+                    } else {
+                        "Drop more files or folders here"
+                    }
                 }
                 if let Some(problem) = problem() {
                     p { class: "problem", "{problem}" }
@@ -192,9 +216,16 @@ fn ItemRow(item: Item, problem: Signal<Option<String>>) -> Element {
             Err(error) => problem.set(Some(error.to_string())),
         }
     };
+    let skipped = match &item.kind {
+        ItemKind::Folder(snapshot) => snapshot.skipped.clone(),
+        ItemKind::File => Vec::new(),
+    };
     rsx! {
         li { class: if unavailable.is_some() { "unavailable" },
             span { class: "name", title: "{item.path.display()}", "{item.name}" }
+            if matches!(item.kind, ItemKind::Folder(_)) {
+                span { class: "kind", title: "Arrives on the phone as {item.download_name()}", "Folder" }
+            }
             if let Some(label) = unavailable {
                 span {
                     class: "badge",
@@ -211,6 +242,18 @@ fn ItemRow(item: Item, problem: Signal<Option<String>>) -> Element {
                     engine.remove_item(id);
                 },
                 "×"
+            }
+            if !skipped.is_empty() {
+                details { class: "skipped",
+                    summary {
+                        if skipped.len() == 1 { "1 item left out" } else { "{skipped.len()} items left out" }
+                    }
+                    ul {
+                        for entry in skipped {
+                            li { "{entry.relative.display()} — {entry.reason}" }
+                        }
+                    }
+                }
             }
         }
     }
