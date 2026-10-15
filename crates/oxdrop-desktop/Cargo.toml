@@ -13,5 +13,5 @@ path = "src/main.rs"
 [dependencies]
 oxdrop-core.workspace = true
 oxdrop-server.workspace = true
-dioxus = { workspace = true, features = ["desktop"] }
+dioxus = { workspace = true, features = ["default", "desktop"] }
 qrcode.workspace = true
