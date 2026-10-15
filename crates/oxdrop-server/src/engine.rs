@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use oxdrop_core::{AddError, Added, Item, ItemId, Transfer, TransferLink};
 use tokio::sync::watch;
@@ -92,7 +94,8 @@ impl Live {
 
 /// State shared between the engine handle and the HTTP server.
 pub(crate) struct Shared {
-    address: SocketAddr,
+    /// Where the Transfer Link points: the address of the listener now serving.
+    address: Mutex<SocketAddr>,
     live: Mutex<Live>,
     updates: watch::Sender<TransferState>,
     receivers: AtomicUsize,
@@ -100,15 +103,20 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    fn address(&self) -> SocketAddr {
+        *self.address.lock().expect("address lock poisoned")
+    }
+
     pub(crate) fn live(&self) -> MutexGuard<'_, Live> {
         self.live.lock().expect("transfer lock poisoned")
     }
 
     fn state(&self) -> TransferState {
+        let address = self.address();
         let live = self.live();
         TransferState {
             link: TransferLink {
-                address: self.address,
+                address,
                 secret: live.transfer.secret().clone(),
             },
             items: live.transfer.items().to_vec(),
@@ -147,7 +155,59 @@ impl Drop for ReceiverGuard {
 /// Dropping it stops the server.
 pub struct SenderEngine {
     shared: Arc<Shared>,
-    server: Option<JoinHandle<()>>,
+    /// The port to try first whenever the Sender binds.
+    port: u16,
+    runtime: tokio::runtime::Handle,
+    /// The listener serving now; replaced when the user switches interface.
+    serving: Mutex<Serving>,
+    /// Owns the runtime until shutdown.
+    thread: Option<JoinHandle<()>>,
+}
+
+/// One bound listener serving the Transfer.
+struct Serving {
+    stop: CancellationToken,
+    stopped: mpsc::Receiver<()>,
+}
+
+impl Serving {
+    /// Spawns a server for `listener` on `runtime`.
+    fn start(
+        shared: &Arc<Shared>,
+        runtime: &tokio::runtime::Handle,
+        listener: TcpListener,
+        address: SocketAddr,
+    ) -> Self {
+        let stop = shared.shutdown.child_token();
+        let router = http::router(http::Listening {
+            shared: shared.clone(),
+            address,
+            stop: stop.clone(),
+        });
+        let (done, stopped) = mpsc::channel();
+        let shutdown = stop.clone();
+        runtime.spawn(async move {
+            let listener =
+                tokio::net::TcpListener::from_std(listener).expect("listener is non-blocking");
+            let serve =
+                axum::serve(listener, router).with_graceful_shutdown(shutdown.cancelled_owned());
+            if let Err(error) = serve.await {
+                tracing::error!(%error, %address, "server stopped");
+            }
+            let _ = done.send(());
+        });
+        tracing::info!(%address, "Sender listening");
+        Self { stop, stopped }
+    }
+
+    /// Stops listening and ends this listener's event streams and downloads,
+    /// waiting briefly for its socket to close.
+    fn stop(self) {
+        self.stop.cancel();
+        if self.stopped.recv_timeout(Duration::from_secs(2)).is_err() {
+            tracing::warn!("old listener is slow to close");
+        }
+    }
 }
 
 impl SenderEngine {
@@ -155,16 +215,14 @@ impl SenderEngine {
     pub fn start(config: EngineConfig) -> Result<Self, StartError> {
         let ip = match config.bind {
             BindAddress::Ip(ip) => ip,
-            BindAddress::Auto => network::pick_address().ok_or(StartError::NoNetwork)?,
+            BindAddress::Auto => IpAddr::V4(
+                network::interface_candidates()
+                    .first()
+                    .ok_or(StartError::NoNetwork)?
+                    .ip,
+            ),
         };
-        let requested = SocketAddr::new(ip, config.port);
-        let listener = TcpListener::bind(requested).map_err(|source| StartError::Bind {
-            address: requested,
-            source,
-        })?;
-        listener
-            .set_nonblocking(true)
-            .map_err(StartError::Runtime)?;
+        let listener = bind(ip, config.port)?;
         let address = listener.local_addr().map_err(StartError::Runtime)?;
 
         let transfer = Transfer::open();
@@ -177,7 +235,7 @@ impl SenderEngine {
             receiver_connected: false,
         });
         let shared = Arc::new(Shared {
-            address,
+            address: Mutex::new(address),
             live: Mutex::new(Live {
                 transfer,
                 downloads: HashMap::new(),
@@ -193,28 +251,40 @@ impl SenderEngine {
             .enable_all()
             .build()
             .map_err(StartError::Runtime)?;
-        let router = http::router(shared.clone());
+        let handle = runtime.handle().clone();
+        let serving = Serving::start(&shared, &handle, listener, address);
         let shutdown = shared.shutdown.clone();
-        let server = std::thread::Builder::new()
+        // The runtime lives on its own thread so the engine can be dropped anywhere,
+        // including inside another runtime.
+        let thread = std::thread::Builder::new()
             .name("oxdrop-server".into())
-            .spawn(move || {
-                runtime.block_on(async move {
-                    let listener = tokio::net::TcpListener::from_std(listener)
-                        .expect("listener is non-blocking");
-                    let serve = axum::serve(listener, router)
-                        .with_graceful_shutdown(shutdown.cancelled_owned());
-                    if let Err(error) = serve.await {
-                        tracing::error!(%error, "server stopped");
-                    }
-                });
-            })
+            .spawn(move || runtime.block_on(shutdown.cancelled_owned()))
             .map_err(StartError::Runtime)?;
 
-        tracing::info!(%address, "Sender listening");
         Ok(Self {
             shared,
-            server: Some(server),
+            port: config.port,
+            runtime: handle,
+            serving: Mutex::new(serving),
+            thread: Some(thread),
         })
+    }
+
+    /// Listens on `ip` instead, so the Transfer Link points there. The Transfer and its
+    /// secret are unchanged. If `ip` can't be bound, the Sender keeps listening where it was.
+    pub fn switch_interface(&self, ip: IpAddr) -> Result<(), StartError> {
+        let mut serving = self.serving.lock().expect("serving lock poisoned");
+        if self.shared.address().ip() == ip {
+            return Ok(());
+        }
+        let listener = bind(ip, self.port)?;
+        let address = listener.local_addr().map_err(StartError::Runtime)?;
+        let new = Serving::start(&self.shared, &self.runtime, listener, address);
+        std::mem::replace(&mut *serving, new).stop();
+        *self.shared.address.lock().expect("address lock poisoned") = address;
+        drop(serving);
+        self.shared.publish();
+        Ok(())
     }
 
     pub fn state(&self) -> TransferState {
@@ -260,11 +330,39 @@ impl SenderEngine {
     }
 }
 
+/// Listens on `ip` alone, at `port` if it's free and otherwise at a port the OS picks,
+/// so a busy port never stops the Sender from starting.
+fn bind(ip: IpAddr, port: u16) -> Result<TcpListener, StartError> {
+    let requested = SocketAddr::new(ip, port);
+    let listener = match TcpListener::bind(requested) {
+        // Windows reports ports reserved by Hyper-V/WSL as access denied.
+        Err(error)
+            if port != 0
+                && matches!(
+                    error.kind(),
+                    ErrorKind::AddrInUse | ErrorKind::PermissionDenied
+                ) =>
+        {
+            tracing::info!(%requested, %error, "port unavailable; letting the OS pick one");
+            TcpListener::bind(SocketAddr::new(ip, 0))
+        }
+        result => result,
+    }
+    .map_err(|source| StartError::Bind {
+        address: requested,
+        source,
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(StartError::Runtime)?;
+    Ok(listener)
+}
+
 impl Drop for SenderEngine {
     fn drop(&mut self) {
         self.shared.shutdown.cancel();
-        if let Some(server) = self.server.take() {
-            let _ = server.join();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
