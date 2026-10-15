@@ -7,11 +7,15 @@ use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use oxdrop_core::{AddError, Added, Item, ItemId, Transfer, TransferLink};
+use oxdrop_core::{AddError, Added, Item, ItemId, ItemStatus, Transfer, TransferLink};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::{http, network};
+
+/// How often the Sender rechecks Items' files, so Changed and Missing show up
+/// without waiting for the Receiver to ask for them.
+const CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The port the Sender listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 48230;
@@ -69,25 +73,38 @@ pub(crate) struct Live {
 }
 
 impl Live {
+    /// Rechecks an Item's file against its snapshot. Returns its status and whether
+    /// that differs from what was recorded before, or `None` if there's no such Item.
+    fn check(&mut self, id: ItemId) -> Option<(ItemStatus, bool)> {
+        let before = self.transfer.item(id)?.status;
+        let after = self.transfer.check(id)?;
+        Some((after, after != before))
+    }
+
     /// The Item to serve and a token that is cancelled if the Item is removed or the engine stops.
-    pub(crate) fn start_download(
+    fn start_download(
         &mut self,
         id: ItemId,
         shutdown: &CancellationToken,
-    ) -> Option<(Item, CancellationToken)> {
-        let item = self.transfer.item(id)?.clone();
+    ) -> Result<(Item, CancellationToken), Refusal> {
+        let item = self.transfer.item(id).ok_or(Refusal::NoSuchItem)?.clone();
         let token = self
             .downloads
             .entry(id)
             .or_insert_with(|| shutdown.child_token())
             .clone();
-        Some((item, token))
+        Ok((item, token))
     }
 
-    fn remove(&mut self, id: ItemId) -> bool {
+    /// Aborts the Item's in-flight downloads.
+    fn cancel_downloads(&mut self, id: ItemId) {
         if let Some(downloads) = self.downloads.remove(&id) {
             downloads.cancel();
         }
+    }
+
+    fn remove(&mut self, id: ItemId) -> bool {
+        self.cancel_downloads(id);
         self.transfer.remove(id)
     }
 }
@@ -134,12 +151,54 @@ impl Shared {
         self.updates.subscribe()
     }
 
+    /// Rechecks every Item's file against its snapshot, telling subscribers if any
+    /// became Changed or Missing (or matches again).
+    fn check_items(&self) {
+        let any_changed = {
+            let mut live = self.live();
+            let ids: Vec<ItemId> = live.transfer.items().iter().map(|item| item.id).collect();
+            ids.into_iter()
+                .filter_map(|id| live.check(id))
+                .fold(false, |any, (_, changed)| any || changed)
+        };
+        if any_changed {
+            self.publish();
+        }
+    }
+
+    /// Rechecks the Item's file, then hands out what to serve: the Item as snapshotted
+    /// and a token that is cancelled if the Item is removed or the engine stops.
+    pub(crate) fn start_download(&self, id: ItemId) -> Result<(Item, CancellationToken), Refusal> {
+        let (outcome, status_changed) = {
+            let mut live = self.live();
+            match live.check(id) {
+                None => (Err(Refusal::NoSuchItem), false),
+                Some((ItemStatus::Available, changed)) => {
+                    (live.start_download(id, &self.shutdown), changed)
+                }
+                Some((status, changed)) => (Err(Refusal::Unavailable(status)), changed),
+            }
+        };
+        if status_changed {
+            self.publish();
+        }
+        outcome
+    }
+
     /// Marks a Receiver as connected until the returned guard is dropped.
     pub(crate) fn connect_receiver(self: &Arc<Self>) -> ReceiverGuard {
         self.receivers.fetch_add(1, Ordering::SeqCst);
         self.publish();
         ReceiverGuard(self.clone())
     }
+}
+
+/// Why an Item can't be downloaded right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    NoSuchItem,
+    /// The Item's file is Changed or Missing.
+    Unavailable(ItemStatus),
 }
 
 pub(crate) struct ReceiverGuard(Arc<Shared>);
@@ -253,6 +312,18 @@ impl SenderEngine {
             .map_err(StartError::Runtime)?;
         let handle = runtime.handle().clone();
         let serving = Serving::start(&shared, &handle, listener, address);
+        handle.spawn({
+            let shared = shared.clone();
+            async move {
+                let mut ticks = tokio::time::interval(CHECK_INTERVAL);
+                loop {
+                    tokio::select! {
+                        () = shared.shutdown.cancelled() => break,
+                        _ = ticks.tick() => shared.check_items(),
+                    }
+                }
+            }
+        });
         let shutdown = shared.shutdown.clone();
         // The runtime lives on its own thread so the engine can be dropped anywhere,
         // including inside another runtime.
@@ -318,6 +389,26 @@ impl SenderEngine {
             self.shared.publish();
         }
         outcomes
+    }
+
+    /// Rechecks every Item's file now. The engine also does this every few seconds.
+    pub fn check_items(&self) {
+        self.shared.check_items();
+    }
+
+    /// Snapshots an Item's file again so its current contents are offered, aborting
+    /// downloads of the previous version. Returns whether there was such an Item.
+    /// If the file can't be read, the Item stays Missing and the error says why.
+    pub fn refresh_item(&self, id: ItemId) -> Result<bool, AddError> {
+        let refreshed = {
+            let mut live = self.shared.live();
+            live.cancel_downloads(id);
+            live.transfer.refresh(id)
+        };
+        if !matches!(refreshed, Ok(false)) {
+            self.shared.publish();
+        }
+        refreshed
     }
 
     /// Removes an Item and aborts its in-flight downloads. Returns whether it was there.

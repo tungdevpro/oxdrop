@@ -1,24 +1,27 @@
 use std::convert::Infallible;
+use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRef, Path, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use futures_util::{Stream, StreamExt};
-use oxdrop_core::{ItemId, android_safe_name};
+use oxdrop_core::{Item, ItemId, ItemStatus, android_safe_name};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tokio_stream::wrappers::WatchStream;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::Shared;
+use crate::engine::{Refusal, Shared};
 use crate::page::{self, ReceiverView};
+use crate::range::Requested;
 
 /// What one bound listener serves: the shared Transfer, plus the address it answers
 /// to and the switch that stops it.
@@ -121,41 +124,118 @@ async fn events(
 async fn download_item(
     State(Listening { shared, stop, .. }): State<Listening>,
     Path((secret, item_id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     check_secret(&shared, &secret)?;
     let id: ItemId = item_id.parse().map_err(|_| StatusCode::NOT_FOUND)?;
-    let (item, cancelled) = shared
-        .live()
-        .start_download(id, &shared.shutdown)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let (item, cancelled) = match shared.start_download(id) {
+        Ok(download) => download,
+        Err(Refusal::NoSuchItem) => return Err(StatusCode::NOT_FOUND),
+        Err(Refusal::Unavailable(status)) => return Ok(unavailable(status)),
+    };
 
-    let file = tokio::fs::File::open(&item.path).await.map_err(|error| {
-        tracing::warn!(%error, item = %item.id, "can't open Item");
-        StatusCode::NOT_FOUND
-    })?;
-    // Content-Length must describe exactly the bytes we stream, so take it from the open handle.
-    let length = file
-        .metadata()
+    let etag = item.etag();
+    let (status, start, length) = match Requested::from_headers(&headers, item.size, &etag) {
+        Requested::Full => (StatusCode::OK, 0, item.size),
+        Requested::Partial { start, end } => (StatusCode::PARTIAL_CONTENT, start, end - start + 1),
+        Requested::Unsatisfiable => {
+            return Ok((
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{}", item.size))],
+            )
+                .into_response());
+        }
+    };
+
+    let file = match tokio::fs::File::open(&item.path).await {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(%error, item = %item.id, "can't open Item");
+            return Ok(unavailable(ItemStatus::Missing));
+        }
+    };
+    let bytes = snapshot_bytes(file, &item, start, length)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .len();
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok((
+    let mut response = (
+        status,
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
             (header::CONTENT_LENGTH, length.to_string()),
             (header::CONTENT_DISPOSITION, content_disposition(&item.name)),
+            (header::ETAG, etag),
+            (header::ACCEPT_RANGES, "bytes".to_owned()),
         ],
-        Body::from_stream(abortable(ReaderStream::new(file), cancelled, stop)),
+        Body::from_stream(abortable(bytes, cancelled, stop)),
     )
-        .into_response())
+        .into_response();
+    if status == StatusCode::PARTIAL_CONTENT {
+        let range = format!("bytes {start}-{}/{}", start + length - 1, item.size);
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&range).expect("ASCII header value"),
+        );
+    }
+    Ok(response)
+}
+
+/// Streams `length` bytes of the Item's `file` from `start`. Before the final chunk goes
+/// out, the file is checked against the snapshot again; if it changed, the stream fails
+/// instead, so the response never completes and the Receiver's browser marks the download
+/// failed rather than keeping a half-old file. (A file that shrinks fails by ending early.)
+async fn snapshot_bytes(
+    mut file: tokio::fs::File,
+    item: &Item,
+    start: u64,
+    length: u64,
+) -> std::io::Result<impl Stream<Item = std::io::Result<Bytes>> + Send + Unpin + use<>> {
+    file.seek(SeekFrom::Start(start)).await?;
+    let probe = file.try_clone().await?;
+    let (size, modified) = (item.size, item.modified);
+    let unchanged = move |metadata: std::fs::Metadata| {
+        metadata.len() == size && metadata.modified().ok() == Some(modified)
+    };
+    let chunks = ReaderStream::new(file.take(length));
+    Ok(Box::pin(futures_util::stream::unfold(
+        Some((chunks, probe, length)),
+        move |state| async move {
+            let (mut chunks, probe, remaining) = state?;
+            let chunk = match chunks.next().await? {
+                Ok(chunk) => chunk,
+                Err(error) => return Some((Err(error), None)),
+            };
+            let remaining = remaining - chunk.len() as u64;
+            if remaining == 0 && !probe.metadata().await.is_ok_and(unchanged) {
+                let error = std::io::Error::other("the file changed while being sent");
+                return Some((Err(error), None));
+            }
+            Some((Ok(chunk), Some((chunks, probe, remaining))))
+        },
+    )))
+}
+
+/// `409 Conflict` with a short explanation the Receiver's browser can show.
+fn unavailable(status: ItemStatus) -> Response {
+    let reason = match status {
+        ItemStatus::Missing => {
+            "This file is no longer on the computer. Ask the sender to add it again."
+        }
+        _ => "This file changed on the computer after it was added. Ask the sender to refresh it.",
+    };
+    (
+        StatusCode::CONFLICT,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        reason,
+    )
+        .into_response()
 }
 
 /// Passes `chunks` through until the Item is withdrawn (`withdrawn`) or this listener
 /// stops (`stop`), then fails the stream so the connection is cut and the Receiver's
 /// browser marks the download as failed, rather than ending early as if it were complete.
 fn abortable(
-    chunks: ReaderStream<tokio::fs::File>,
+    chunks: impl Stream<Item = std::io::Result<Bytes>> + Send + Unpin,
     withdrawn: CancellationToken,
     stop: CancellationToken,
 ) -> impl Stream<Item = std::io::Result<Bytes>> {

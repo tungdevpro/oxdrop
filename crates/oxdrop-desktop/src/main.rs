@@ -10,7 +10,7 @@ use std::sync::Arc;
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 use dioxus::html::HasFileData;
 use dioxus::prelude::*;
-use oxdrop_core::{Item, format_size};
+use oxdrop_core::{Item, ItemStatus, format_size};
 use oxdrop_server::{EngineConfig, SenderEngine, interface_candidates};
 use qrcode::QrCode;
 use qrcode::render::svg;
@@ -47,6 +47,10 @@ li { align-items: center; }
 .status.connected { color: var(--text); }
 .status.connected .dot { background: #12b76a; }
 .failed { margin: auto; max-width: 420px; text-align: center; }
+li.unavailable .name, li.unavailable .size { color: var(--muted); }
+.badge { flex: none; padding: 1px 8px; border-radius: 999px; background: var(--problem); color: #fff; font-size: 12px; font-weight: 600; }
+.refresh { flex: none; padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--text); font: inherit; font-size: 12px; }
+.refresh:hover { border-color: var(--accent); }
 .interface { display: flex; align-items: center; gap: 8px; width: 100%; color: var(--muted); font-size: 12px; }
 .interface select { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
 </style>"#;
@@ -157,7 +161,7 @@ fn App() -> Element {
                 if !items.is_empty() {
                     ul {
                         for item in items {
-                            ItemRow { key: "{item.id}", item }
+                            ItemRow { key: "{item.id}", item, problem }
                         }
                     }
                 }
@@ -173,12 +177,32 @@ fn App() -> Element {
 }
 
 #[component]
-fn ItemRow(item: Item) -> Element {
+fn ItemRow(item: Item, problem: Signal<Option<String>>) -> Element {
     let Engine(engine) = use_context::<Engine>();
     let id = item.id;
+    let unavailable = match item.status {
+        ItemStatus::Available => None,
+        ItemStatus::Changed => Some("Changed"),
+        ItemStatus::Missing => Some("Missing"),
+    };
+    let refresh = {
+        let engine = engine.clone();
+        move |_| match engine.refresh_item(id) {
+            Ok(_) => problem.set(None),
+            Err(error) => problem.set(Some(error.to_string())),
+        }
+    };
     rsx! {
-        li {
+        li { class: if unavailable.is_some() { "unavailable" },
             span { class: "name", title: "{item.path.display()}", "{item.name}" }
+            if let Some(label) = unavailable {
+                span {
+                    class: "badge",
+                    title: "The file on disk no longer matches what was added; the phone can't download it until you refresh.",
+                    "{label}"
+                }
+                button { class: "refresh", onclick: refresh, "Refresh" }
+            }
             span { class: "size", "{format_size(item.size)}" }
             button {
                 class: "remove",

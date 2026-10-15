@@ -127,7 +127,8 @@ async fn unknown_item_is_not_found() {
     let h = Harness::new();
     h.add_file("notes.txt", b"hello");
 
-    for path in ["items/999", "items/not-an-id", "items/../../etc/passwd"] {
+    // Traversal attempts are in reachability.rs; reqwest would normalize `..` away here.
+    for path in ["items/999", "items/not-an-id"] {
         assert_eq!(h.get(path).await.status(), 404, "{path}");
     }
 }
