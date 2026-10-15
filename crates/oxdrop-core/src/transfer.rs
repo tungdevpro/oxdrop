@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::SystemTime;
 
 use crate::TransferSecret;
 use crate::names::unique_name;
@@ -39,6 +40,16 @@ impl Added {
     }
 }
 
+/// Whether an Item's file still matches the snapshot taken when it was added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemStatus {
+    Available,
+    /// The file was edited after it was added.
+    Changed,
+    /// The file was deleted or moved after it was added.
+    Missing,
+}
+
 /// One file within a Transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
@@ -46,7 +57,24 @@ pub struct Item {
     /// The Item Name: what both the Sender and the Receiver call this Item.
     pub name: String,
     pub path: PathBuf,
+    /// The file's size when snapshotted; exactly what a download serves.
     pub size: u64,
+    /// The file's modification time when snapshotted.
+    pub modified: SystemTime,
+    pub status: ItemStatus,
+}
+
+impl Item {
+    /// A strong `ETag` naming this snapshot of the file, so a browser resuming a
+    /// download never splices bytes from two different versions.
+    pub fn etag(&self) -> String {
+        let modified = self
+            .modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("\"{:x}-{modified:x}\"", self.size)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +88,30 @@ pub enum AddError {
     Folder { path: PathBuf },
     #[error("{} is not a regular file", path.display())]
     NotAFile { path: PathBuf },
+}
+
+/// The metadata of the regular file at `path`, or why it can't be an Item.
+fn file_metadata(path: &Path) -> Result<std::fs::Metadata, AddError> {
+    let metadata = std::fs::metadata(path).map_err(|source| AddError::Unreadable {
+        path: path.to_owned(),
+        source,
+    })?;
+    if metadata.is_dir() {
+        return Err(AddError::Folder {
+            path: path.to_owned(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(AddError::NotAFile {
+            path: path.to_owned(),
+        });
+    }
+    Ok(metadata)
+}
+
+/// The modification time to snapshot; filesystems that don't record one all read as the epoch.
+fn modified(metadata: &std::fs::Metadata) -> SystemTime {
+    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 /// A set of Items the Sender offers to the Receiver, reachable with its secret.
@@ -102,18 +154,10 @@ impl Transfer {
         if let Some(existing) = self.items.iter().find(|item| item.path == *path) {
             return Ok(Added::AlreadyPresent(existing.id));
         }
-        let metadata = std::fs::metadata(path).map_err(|source| AddError::Unreadable {
-            path: path.to_owned(),
-            source,
-        })?;
-        if metadata.is_dir() {
-            return Err(AddError::Folder {
-                path: path.to_owned(),
-            });
-        }
+        let metadata = file_metadata(path)?;
         let file_name = match path.file_name() {
-            Some(name) if metadata.is_file() => name.to_string_lossy(),
-            _ => {
+            Some(name) => name.to_string_lossy(),
+            None => {
                 return Err(AddError::NotAFile {
                     path: path.to_owned(),
                 });
@@ -127,8 +171,45 @@ impl Transfer {
             name,
             path: path.to_owned(),
             size: metadata.len(),
+            modified: modified(&metadata),
+            status: ItemStatus::Available,
         });
         Ok(Added::New(id))
+    }
+
+    /// Snapshots an Item's file again, so its current contents are what's offered.
+    /// Returns whether there was such an Item; if its file can't be read it becomes Missing.
+    pub fn refresh(&mut self, id: ItemId) -> Result<bool, AddError> {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return Ok(false);
+        };
+        match file_metadata(&item.path) {
+            Ok(metadata) => {
+                item.size = metadata.len();
+                item.modified = modified(&metadata);
+                item.status = ItemStatus::Available;
+                Ok(true)
+            }
+            Err(error) => {
+                item.status = ItemStatus::Missing;
+                Err(error)
+            }
+        }
+    }
+
+    /// Rechecks an Item's file against its snapshot and records the result.
+    /// Returns the Item's status, or `None` if there's no such Item.
+    pub fn check(&mut self, id: ItemId) -> Option<ItemStatus> {
+        let item = self.items.iter_mut().find(|item| item.id == id)?;
+        item.status = match std::fs::metadata(&item.path) {
+            Ok(metadata) if !metadata.is_file() => ItemStatus::Missing,
+            Ok(metadata) if metadata.len() == item.size && modified(&metadata) == item.modified => {
+                ItemStatus::Available
+            }
+            Ok(_) => ItemStatus::Changed,
+            Err(_) => ItemStatus::Missing,
+        };
+        Some(item.status)
     }
 
     /// Removes an Item, freeing its Item Name. Returns whether it was there.

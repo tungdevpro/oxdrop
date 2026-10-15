@@ -1,7 +1,7 @@
 //! The Receiver page: server-rendered HTML that works in any Android browser.
 
 use dioxus::prelude::*;
-use oxdrop_core::{Item, format_size};
+use oxdrop_core::{Item, ItemStatus, format_size};
 
 const HEAD: &str = r#"<!doctype html>
 <html lang="en">
@@ -26,6 +26,8 @@ ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
 .name { flex: 1; min-width: 0; overflow-wrap: anywhere; font-weight: 500; }
 .size { color: var(--muted); font-size: 14px; white-space: nowrap; }
 .get { color: var(--accent); font-weight: 600; font-size: 14px; }
+.unavailable { flex-wrap: wrap; opacity: .6; }
+.note { flex-basis: 100%; color: var(--muted); font-size: 14px; }
 .empty { color: var(--muted); padding: 32px 0; text-align: center; }
 </style>
 </head>
@@ -46,13 +48,20 @@ const SCRIPT: &str = r#"<script>
   events.addEventListener("transfer", (message) => {
     const { items } = JSON.parse(message.data);
     list.replaceChildren(...items.map((item) => {
-      const link = document.createElement("a");
-      link.className = "item";
-      link.href = "items/" + item.id;
-      link.download = item.name;
-      link.append(span("name", item.name), span("size", item.size), span("get", "Download"));
+      let row;
+      if (item.note) {
+        row = document.createElement("div");
+        row.className = "item unavailable";
+        row.append(span("name", item.name), span("size", item.size), span("note", item.note));
+      } else {
+        row = document.createElement("a");
+        row.className = "item";
+        row.href = "items/" + item.id;
+        row.download = item.name;
+        row.append(span("name", item.name), span("size", item.size), span("get", "Download"));
+      }
       const li = document.createElement("li");
-      li.append(link);
+      li.append(row);
       return li;
     }));
     status.className = items.length ? "hint" : "empty";
@@ -75,6 +84,27 @@ struct ReceiverItem {
     id: String,
     name: String,
     size: String,
+    /// `available`, `changed` or `missing`.
+    status: &'static str,
+    /// Why the Item can't be downloaded right now, if it can't.
+    note: Option<&'static str>,
+}
+
+fn status_name(status: ItemStatus) -> &'static str {
+    match status {
+        ItemStatus::Available => "available",
+        ItemStatus::Changed => "changed",
+        ItemStatus::Missing => "missing",
+    }
+}
+
+/// What the Receiver is told about an Item it can't download.
+fn unavailable_note(status: ItemStatus) -> Option<&'static str> {
+    match status {
+        ItemStatus::Available => None,
+        ItemStatus::Changed => Some("Changed on the computer. Ask the sender to refresh it."),
+        ItemStatus::Missing => Some("No longer on the computer."),
+    }
 }
 
 impl ReceiverView {
@@ -86,6 +116,8 @@ impl ReceiverView {
                     id: item.id.to_string(),
                     name: item.name.clone(),
                     size: format_size(item.size),
+                    status: status_name(item.status),
+                    note: unavailable_note(item.status),
                 })
                 .collect(),
         }
@@ -105,10 +137,18 @@ pub(crate) fn render(items: &[Item]) -> String {
             ul { id: "items",
                 for item in items {
                     li { key: "{item.id}",
-                        a { class: "item", href: "items/{item.id}", download: "{item.name}",
-                            span { class: "name", "{item.name}" }
-                            span { class: "size", "{format_size(item.size)}" }
-                            span { class: "get", "Download" }
+                        if let Some(note) = unavailable_note(item.status) {
+                            div { class: "item unavailable",
+                                span { class: "name", "{item.name}" }
+                                span { class: "size", "{format_size(item.size)}" }
+                                span { class: "note", "{note}" }
+                            }
+                        } else {
+                            a { class: "item", href: "items/{item.id}", download: "{item.name}",
+                                span { class: "name", "{item.name}" }
+                                span { class: "size", "{format_size(item.size)}" }
+                                span { class: "get", "Download" }
+                            }
                         }
                     }
                 }

@@ -13,4 +13,4 @@ pub use link::TransferLink;
 pub use names::android_safe_name;
 pub use secret::TransferSecret;
 pub use size::format_size;
-pub use transfer::{AddError, Added, Item, ItemId, Transfer};
+pub use transfer::{AddError, Added, Item, ItemId, ItemStatus, Transfer};

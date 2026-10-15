@@ -5,6 +5,7 @@ mod engine;
 mod http;
 mod network;
 mod page;
+mod range;
 
 pub use engine::{BindAddress, EngineConfig, SenderEngine, StartError, TransferState};
 pub use network::interface_candidates;
