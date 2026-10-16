@@ -24,8 +24,9 @@ Working now:
 - Several files at once, a phone page that updates live, and a "phone connected" indicator
 - Automatic choice of the network interface the phone can reach, with a dropdown to change it
 - Downloads that resume, and files marked Changed or Missing if they change on disk after you add them
+- Folders, which arrive as one zip that keeps their structure and can be resumed, even with files over 4 GB inside
 
-Still to come: folders as zip files, Download all, per-Item progress, ending a Transfer (including after being idle), and signed installers.
+Still to come: Download all, per-Item progress, ending a Transfer (including after being idle), and signed installers.
 
 ## Building and running
 
