@@ -10,7 +10,7 @@ use std::sync::Arc;
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 use dioxus::html::HasFileData;
 use dioxus::prelude::*;
-use oxdrop_core::{Item, ItemKind, ItemStatus, format_size};
+use oxdrop_core::{Item, ItemKind, ItemStatus, Progress, format_size};
 use oxdrop_server::{EngineConfig, SenderEngine, interface_candidates};
 use qrcode::QrCode;
 use qrcode::render::svg;
@@ -57,6 +57,12 @@ li.unavailable .name, li.unavailable .size { color: var(--muted); }
 .refresh { flex: none; padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--text); font: inherit; font-size: 12px; }
 .refresh:hover { border-color: var(--accent); }
 .interface { display: flex; align-items: center; gap: 8px; width: 100%; color: var(--muted); font-size: 12px; }
+.progress { flex: none; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.progress.done { color: #12b76a; font-weight: 600; }
+.progress.failed { color: var(--problem); }
+.bar { flex-basis: 100%; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.bar span { display: block; height: 100%; background: var(--accent); }
+.bar.failed span { background: var(--problem); }
 .interface select { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
 </style>"#;
 
@@ -181,7 +187,12 @@ fn App() -> Element {
                 if !items.is_empty() {
                     ul {
                         for item in items {
-                            ItemRow { key: "{item.id}", item, problem }
+                            ItemRow {
+                                key: "{item.id}",
+                                progress: state.read().progress_of(item.id),
+                                item,
+                                problem,
+                            }
                         }
                     }
                 }
@@ -201,7 +212,7 @@ fn App() -> Element {
 }
 
 #[component]
-fn ItemRow(item: Item, problem: Signal<Option<String>>) -> Element {
+fn ItemRow(item: Item, progress: Progress, problem: Signal<Option<String>>) -> Element {
     let Engine(engine) = use_context::<Engine>();
     let id = item.id;
     let unavailable = match item.status {
@@ -234,6 +245,22 @@ fn ItemRow(item: Item, problem: Signal<Option<String>>) -> Element {
                 }
                 button { class: "refresh", onclick: refresh, "Refresh" }
             }
+            match progress {
+                Progress::NotStarted => rsx! {},
+                Progress::Receiving { served, total } => rsx! {
+                    span { class: "progress", title: "{format_size(served)} of {format_size(total)} sent", "Sending {percent(served, total)}%" }
+                },
+                Progress::Done => rsx! {
+                    span { class: "progress done", title: "The phone received all of it", "Sent" }
+                },
+                Progress::Failed { served, total } => rsx! {
+                    span {
+                        class: "progress failed",
+                        title: "The download broke off; the phone can resume it",
+                        "Stopped at {percent(served, total)}%"
+                    }
+                },
+            }
             span { class: "size", "{format_size(item.size)}" }
             button {
                 class: "remove",
@@ -242,6 +269,19 @@ fn ItemRow(item: Item, problem: Signal<Option<String>>) -> Element {
                     engine.remove_item(id);
                 },
                 "×"
+            }
+            match progress {
+                Progress::Receiving { served, total } => rsx! {
+                    div { class: "bar",
+                        span { style: "width: {percent(served, total)}%" }
+                    }
+                },
+                Progress::Failed { served, total } => rsx! {
+                    div { class: "bar failed",
+                        span { style: "width: {percent(served, total)}%" }
+                    }
+                },
+                _ => rsx! {},
             }
             if !skipped.is_empty() {
                 details { class: "skipped",
@@ -257,6 +297,14 @@ fn ItemRow(item: Item, problem: Signal<Option<String>>) -> Element {
             }
         }
     }
+}
+
+/// `served` as a whole percentage of `total`, rounded down so 100% means all of it.
+fn percent(served: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 100;
+    }
+    (u128::from(served) * 100 / u128::from(total)) as u64
 }
 
 /// Lets the user move the Transfer Link to another interface when the automatic

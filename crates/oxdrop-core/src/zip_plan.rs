@@ -9,6 +9,7 @@
 //! Format: PKWARE APPNOTE 6.3.10, with Zip64 records whenever a size or offset doesn't
 //! fit in 32 bits.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -60,6 +61,8 @@ pub struct ZipPlan {
     segments: Vec<Segment>,
     central_directory_offset: u64,
     len: u64,
+    /// For a whole Transfer's zip, the stretch each Item's entries occupy, in order.
+    item_spans: Vec<Range<u64>>,
 }
 
 const LOCAL_HEADER: u32 = 0x0403_4b50;
@@ -100,7 +103,10 @@ impl ZipPlan {
     /// Item as a file and a folder Item as a directory, with names made safe for Android.
     pub fn for_items(items: &[Item]) -> Self {
         let mut entries = Vec::new();
+        // Each Item's entries, as a range of indices into `entries`.
+        let mut item_entries = Vec::with_capacity(items.len());
         for item in items {
+            let first = entries.len();
             match &item.kind {
                 ItemKind::File => entries.push(ZipEntry {
                     name: android_safe_name(&item.name),
@@ -117,8 +123,20 @@ impl ZipPlan {
                     snapshot,
                 )),
             }
+            item_entries.push(first..entries.len());
         }
-        Self::new(entries)
+        let mut plan = Self::new(entries);
+        let ends = |entry: usize| {
+            plan.header_offsets
+                .get(entry)
+                .copied()
+                .unwrap_or(plan.central_directory_offset)
+        };
+        plan.item_spans = item_entries
+            .into_iter()
+            .map(|entries| ends(entries.start)..ends(entries.end))
+            .collect();
+        plan
     }
 
     pub fn new(entries: Vec<ZipEntry>) -> Self {
@@ -165,6 +183,7 @@ impl ZipPlan {
             segments,
             central_directory_offset,
             len: 0,
+            item_spans: Vec::new(),
         };
         let tail_len = plan.tail(|_| 0).len() as u64;
         plan.segments.push(Segment {
@@ -187,6 +206,12 @@ impl ZipPlan {
 
     pub fn entries(&self) -> &[ZipEntry] {
         &self.entries
+    }
+
+    /// For the zip of a whole Transfer, the bytes each Item's entries occupy, in the
+    /// order the Items were given. Empty for any other zip.
+    pub fn item_spans(&self) -> &[Range<u64>] {
+        &self.item_spans
     }
 
     /// Every stretch of the zip, in order and without gaps.

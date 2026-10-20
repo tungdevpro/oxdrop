@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRef, Path, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::engine::{AllRefusal, Refusal, Shared};
 use crate::page::{self, ReceiverView};
 use crate::range::Requested;
+use crate::tracked::{ByteStream, Share, Tracked};
 use crate::zip_stream::zip_range;
 
 /// What one bound listener serves: the shared Transfer, plus the address it answers
@@ -126,6 +127,7 @@ async fn events(
 async fn download_item(
     State(Listening { shared, stop, .. }): State<Listening>,
     Path((secret, item_id)): Path<(String, String)>,
+    method: Method,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     check_secret(&shared, &secret)?;
@@ -155,16 +157,37 @@ async fn download_item(
         let bytes = snapshot_bytes(file, &item, span.start, span.length)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let share = Share {
+            item: item.id,
+            identity: etag.clone(),
+            at: 0,
+            total: item.size,
+        };
         let download = Download {
             content_type: "application/octet-stream",
             name,
             etag,
             span,
+            head: method == Method::HEAD,
         };
-        return Ok(download.respond(Box::pin(bytes), withdrawn, stop));
+        let progress = (shared, vec![share]);
+        return Ok(download.respond(Box::pin(bytes), progress, withdrawn, stop));
     };
     let plan = ZipPlan::for_folder(&item.name, &item.path, item.modified, snapshot);
-    match serve_zip(&shared, plan, &headers, name, etag, withdrawn, stop).await {
+    let share = Share {
+        item: item.id,
+        identity: etag.clone(),
+        at: 0,
+        total: plan.len(),
+    };
+    let zip = Zip {
+        plan,
+        name,
+        etag,
+        shares: vec![share],
+        head: method == Method::HEAD,
+    };
+    match serve_zip(&shared, zip, &headers, withdrawn, stop).await {
         Ok(response) => Ok(response),
         Err(error) => {
             tracing::warn!(%error, item = %item.id, "folder changed while preparing zip");
@@ -177,6 +200,7 @@ async fn download_item(
 async fn download_all(
     State(Listening { shared, stop, .. }): State<Listening>,
     Path(secret): Path<String>,
+    method: Method,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     check_secret(&shared, &secret)?;
@@ -196,17 +220,24 @@ async fn download_all(
     };
     let plan = ZipPlan::for_items(&items);
     let etag = all_etag(&items);
-    match serve_zip(
-        &shared,
+    let shares = items
+        .iter()
+        .zip(plan.item_spans())
+        .map(|(item, span)| Share {
+            item: item.id,
+            identity: etag.clone(),
+            at: span.start,
+            total: span.end - span.start,
+        })
+        .collect();
+    let zip = Zip {
         plan,
-        &headers,
-        ALL_NAME.to_owned(),
+        name: ALL_NAME.to_owned(),
         etag,
-        withdrawn,
-        stop,
-    )
-    .await
-    {
+        shares,
+        head: method == Method::HEAD,
+    };
+    match serve_zip(&shared, zip, &headers, withdrawn, stop).await {
         Ok(response) => Ok(response),
         Err(error) => {
             tracing::warn!(%error, "an Item changed while preparing the Download all zip");
@@ -229,17 +260,33 @@ fn all_etag(items: &[Item]) -> String {
     format!("\"a{:x}-{:x}\"", items.len(), hasher.finish())
 }
 
-/// Serves the part of `plan`'s zip the request asks for. Fails if a file it needs
-/// differs from its snapshot.
-async fn serve_zip(
-    shared: &Shared,
+/// A zip to serve: its layout, what the Receiver saves it as and its `ETag`, and where
+/// the Item downloads it holds sit in it.
+struct Zip {
     plan: ZipPlan,
-    headers: &HeaderMap,
     name: String,
     etag: String,
+    shares: Vec<Share>,
+    /// Whether only the headers are wanted.
+    head: bool,
+}
+
+/// Serves the part of the zip the request asks for. Fails if a file it needs differs
+/// from its snapshot.
+async fn serve_zip(
+    shared: &Arc<Shared>,
+    zip: Zip,
+    headers: &HeaderMap,
     withdrawn: impl Future<Output = ()> + Send + 'static,
     stop: CancellationToken,
 ) -> std::io::Result<Response> {
+    let Zip {
+        plan,
+        name,
+        etag,
+        shares,
+        head,
+    } = zip;
     let span = match Span::requested(headers, plan.len(), &etag) {
         Ok(span) => span,
         Err(unsatisfiable) => return Ok(unsatisfiable.into_response()),
@@ -251,8 +298,10 @@ async fn serve_zip(
         name,
         etag,
         span,
+        head,
     };
-    Ok(download.respond(Box::pin(bytes), withdrawn, stop))
+    let progress = (shared.clone(), shares);
+    Ok(download.respond(Box::pin(bytes), progress, withdrawn, stop))
 }
 
 /// Which bytes of a download of `total` bytes to send, and with what status.
@@ -304,13 +353,17 @@ struct Download {
     name: String,
     etag: String,
     span: Span,
+    /// Whether only the headers are wanted, so nothing is served toward any download.
+    head: bool,
 }
 
 impl Download {
-    /// Streams `bytes` as this download, cut off if it is withdrawn or the listener stops.
+    /// Streams `bytes` as this download, reporting progress toward the Item downloads in
+    /// `shares` and cut off if it is withdrawn or the listener stops.
     fn respond(
         self,
         bytes: ByteStream,
+        (shared, shares): (Arc<Shared>, Vec<Share>),
         withdrawn: impl Future<Output = ()> + Send + 'static,
         stop: CancellationToken,
     ) -> Response {
@@ -320,6 +373,7 @@ impl Download {
             length,
             total,
         } = self.span;
+        let shares = if self.head { Vec::new() } else { shares };
         let mut response = (
             status,
             [
@@ -329,7 +383,11 @@ impl Download {
                 (header::ETAG, self.etag),
                 (header::ACCEPT_RANGES, "bytes".to_owned()),
             ],
-            Body::from_stream(abortable(bytes, withdrawn, stop)),
+            Body::from_stream(abortable(
+                Tracked::new(bytes, shared, shares, start..start + length),
+                withdrawn,
+                stop,
+            )),
         )
             .into_response();
         if status == StatusCode::PARTIAL_CONTENT {
@@ -342,9 +400,6 @@ impl Download {
         response
     }
 }
-
-/// The body of a download, whichever kind of Item it is.
-type ByteStream = std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 /// Streams `length` bytes of the Item's `file` from `start`. Before the final chunk goes
 /// out, the file is checked against the snapshot again; if it changed, the stream fails
