@@ -19,7 +19,7 @@ use tokio_stream::wrappers::WatchStream;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::{Refusal, Shared};
+use crate::engine::{AllRefusal, Refusal, Shared};
 use crate::page::{self, ReceiverView};
 use crate::range::Requested;
 use crate::zip_stream::zip_range;
@@ -45,6 +45,7 @@ pub(crate) fn router(listening: Listening) -> Router {
         .route("/t/{secret}/", get(receiver_page))
         .route("/t/{secret}/events", get(events))
         .route("/t/{secret}/items/{item_id}", get(download_item))
+        .route("/t/{secret}/all", get(download_all))
         .layer(middleware::from_fn_with_state(
             listening.clone(),
             require_bound_host,
@@ -134,81 +135,212 @@ async fn download_item(
         Err(Refusal::NoSuchItem) => return Err(StatusCode::NOT_FOUND),
         Err(Refusal::Unavailable(status)) => return Ok(unavailable(status)),
     };
+    let withdrawn = cancelled.cancelled_owned();
+    let name = item.download_name();
+    let etag = item.etag();
 
     // A file is served as itself; a folder as a zip laid out from its snapshot.
-    let zip = match &item.kind {
-        ItemKind::File => None,
-        ItemKind::Folder(snapshot) => Some(Arc::new(ZipPlan::for_folder(
-            &item.name,
-            &item.path,
-            item.modified,
-            snapshot,
-        ))),
-    };
-    let (total, content_type) = match &zip {
-        None => (item.size, "application/octet-stream"),
-        Some(plan) => (plan.len(), "application/zip"),
-    };
-
-    let etag = item.etag();
-    let (status, start, length) = match Requested::from_headers(&headers, total, &etag) {
-        Requested::Full => (StatusCode::OK, 0, total),
-        Requested::Partial { start, end } => (StatusCode::PARTIAL_CONTENT, start, end - start + 1),
-        Requested::Unsatisfiable => {
-            return Ok((
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                [(header::CONTENT_RANGE, format!("bytes */{total}"))],
-            )
-                .into_response());
-        }
-    };
-
-    let bytes: ByteStream = match zip {
-        None => {
-            let file = match tokio::fs::File::open(&item.path).await {
-                Ok(file) => file,
-                Err(error) => {
-                    tracing::warn!(%error, item = %item.id, "can't open Item");
-                    return Ok(unavailable(ItemStatus::Missing));
-                }
-            };
-            let bytes = snapshot_bytes(file, &item, start, length)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            Box::pin(bytes)
-        }
-        Some(plan) => match zip_range(plan, shared.crcs.clone(), start, start + length).await {
-            Ok(bytes) => Box::pin(bytes),
+    let ItemKind::Folder(snapshot) = &item.kind else {
+        let span = match Span::requested(&headers, item.size, &etag) {
+            Ok(span) => span,
+            Err(unsatisfiable) => return Ok(unsatisfiable.into_response()),
+        };
+        let file = match tokio::fs::File::open(&item.path).await {
+            Ok(file) => file,
             Err(error) => {
-                tracing::warn!(%error, item = %item.id, "folder changed while preparing zip");
-                return Ok(unavailable(ItemStatus::Changed));
+                tracing::warn!(%error, item = %item.id, "can't open Item");
+                return Ok(unavailable(ItemStatus::Missing));
             }
-        },
+        };
+        let bytes = snapshot_bytes(file, &item, span.start, span.length)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let download = Download {
+            content_type: "application/octet-stream",
+            name,
+            etag,
+            span,
+        };
+        return Ok(download.respond(Box::pin(bytes), withdrawn, stop));
     };
-
-    let mut response = (
-        status,
-        [
-            (header::CONTENT_TYPE, content_type.to_owned()),
-            (header::CONTENT_LENGTH, length.to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                content_disposition(&item.download_name()),
-            ),
-            (header::ETAG, etag),
-            (header::ACCEPT_RANGES, "bytes".to_owned()),
-        ],
-        Body::from_stream(abortable(bytes, cancelled, stop)),
-    )
-        .into_response();
-    if status == StatusCode::PARTIAL_CONTENT {
-        let range = format!("bytes {start}-{}/{total}", start + length - 1);
-        response.headers_mut().insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_str(&range).expect("ASCII header value"),
-        );
+    let plan = ZipPlan::for_folder(&item.name, &item.path, item.modified, snapshot);
+    match serve_zip(&shared, plan, &headers, name, etag, withdrawn, stop).await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            tracing::warn!(%error, item = %item.id, "folder changed while preparing zip");
+            Ok(unavailable(ItemStatus::Changed))
+        }
     }
-    Ok(response)
+}
+
+/// "Download all": every Item in one zip, each at its root under its Item Name.
+async fn download_all(
+    State(Listening { shared, stop, .. }): State<Listening>,
+    Path(secret): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    check_secret(&shared, &secret)?;
+    let (items, tokens) = match shared.start_download_all() {
+        Ok(download) => download,
+        Err(AllRefusal::NoItems) => return Err(StatusCode::NOT_FOUND),
+        Err(AllRefusal::Unavailable(names)) => return Ok(some_unavailable(&names)),
+    };
+    // Withdrawing any one of the Items withdraws the whole zip.
+    let withdrawn = async move {
+        futures_util::future::select_all(
+            tokens
+                .into_iter()
+                .map(|token| Box::pin(token.cancelled_owned())),
+        )
+        .await;
+    };
+    let plan = ZipPlan::for_items(&items);
+    let etag = all_etag(&items);
+    match serve_zip(
+        &shared,
+        plan,
+        &headers,
+        ALL_NAME.to_owned(),
+        etag,
+        withdrawn,
+        stop,
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            tracing::warn!(%error, "an Item changed while preparing the Download all zip");
+            Ok(unavailable(ItemStatus::Changed))
+        }
+    }
+}
+
+/// What the Receiver saves "Download all" as.
+const ALL_NAME: &str = "Oxdrop.zip";
+
+/// A strong `ETag` for "Download all" that changes whenever any Item is added, removed,
+/// renamed or refreshed, so a resumed download never splices two different zips.
+fn all_etag(items: &[Item]) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::hash::DefaultHasher::new();
+    for item in items {
+        (item.id, &item.name, item.etag()).hash(&mut hasher);
+    }
+    format!("\"a{:x}-{:x}\"", items.len(), hasher.finish())
+}
+
+/// Serves the part of `plan`'s zip the request asks for. Fails if a file it needs
+/// differs from its snapshot.
+async fn serve_zip(
+    shared: &Shared,
+    plan: ZipPlan,
+    headers: &HeaderMap,
+    name: String,
+    etag: String,
+    withdrawn: impl Future<Output = ()> + Send + 'static,
+    stop: CancellationToken,
+) -> std::io::Result<Response> {
+    let span = match Span::requested(headers, plan.len(), &etag) {
+        Ok(span) => span,
+        Err(unsatisfiable) => return Ok(unsatisfiable.into_response()),
+    };
+    let end = span.start + span.length;
+    let bytes = zip_range(Arc::new(plan), shared.crcs.clone(), span.start, end).await?;
+    let download = Download {
+        content_type: "application/zip",
+        name,
+        etag,
+        span,
+    };
+    Ok(download.respond(Box::pin(bytes), withdrawn, stop))
+}
+
+/// Which bytes of a download of `total` bytes to send, and with what status.
+struct Span {
+    status: StatusCode,
+    start: u64,
+    length: u64,
+    total: u64,
+}
+
+impl Span {
+    /// The span the request's `Range` (and `If-Range`) headers ask for.
+    fn requested(headers: &HeaderMap, total: u64, etag: &str) -> Result<Self, Unsatisfiable> {
+        let (status, start, length) = match Requested::from_headers(headers, total, etag) {
+            Requested::Full => (StatusCode::OK, 0, total),
+            Requested::Partial { start, end } => {
+                (StatusCode::PARTIAL_CONTENT, start, end - start + 1)
+            }
+            Requested::Unsatisfiable => return Err(Unsatisfiable { total }),
+        };
+        Ok(Self {
+            status,
+            start,
+            length,
+            total,
+        })
+    }
+}
+
+/// No part of a download of `total` bytes is what the request's `Range` asks for.
+struct Unsatisfiable {
+    total: u64,
+}
+
+impl IntoResponse for Unsatisfiable {
+    fn into_response(self) -> Response {
+        let range = format!("bytes */{}", self.total);
+        (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, range)],
+        )
+            .into_response()
+    }
+}
+
+/// A download response: what it is, what the Receiver saves it as, and which bytes.
+struct Download {
+    content_type: &'static str,
+    name: String,
+    etag: String,
+    span: Span,
+}
+
+impl Download {
+    /// Streams `bytes` as this download, cut off if it is withdrawn or the listener stops.
+    fn respond(
+        self,
+        bytes: ByteStream,
+        withdrawn: impl Future<Output = ()> + Send + 'static,
+        stop: CancellationToken,
+    ) -> Response {
+        let Span {
+            status,
+            start,
+            length,
+            total,
+        } = self.span;
+        let mut response = (
+            status,
+            [
+                (header::CONTENT_TYPE, self.content_type.to_owned()),
+                (header::CONTENT_LENGTH, length.to_string()),
+                (header::CONTENT_DISPOSITION, content_disposition(&self.name)),
+                (header::ETAG, self.etag),
+                (header::ACCEPT_RANGES, "bytes".to_owned()),
+            ],
+            Body::from_stream(abortable(bytes, withdrawn, stop)),
+        )
+            .into_response();
+        if status == StatusCode::PARTIAL_CONTENT {
+            let range = format!("bytes {start}-{}/{total}", start + length - 1);
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&range).expect("ASCII header value"),
+            );
+        }
+        response
+    }
 }
 
 /// The body of a download, whichever kind of Item it is.
@@ -265,19 +397,36 @@ fn unavailable(status: ItemStatus) -> Response {
         .into_response()
 }
 
-/// Passes `chunks` through until the Item is withdrawn (`withdrawn`) or this listener
-/// stops (`stop`), then fails the stream so the connection is cut and the Receiver's
-/// browser marks the download as failed, rather than ending early as if it were complete.
+/// `409 Conflict` for "Download all", naming the Items that are Changed or Missing.
+fn some_unavailable(names: &[String]) -> Response {
+    let reason = format!(
+        "Some items changed on the computer or are no longer there: {}. \
+         Ask the sender to refresh or remove them, or download the others one at a time.",
+        names.join(", ")
+    );
+    (
+        StatusCode::CONFLICT,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        reason,
+    )
+        .into_response()
+}
+
+/// Passes `chunks` through until the download is withdrawn (`withdrawn` completes) or
+/// this listener stops (`stop`), then fails the stream so the connection is cut and the
+/// Receiver's browser marks the download as failed, rather than ending early as if it
+/// were complete.
 fn abortable(
     chunks: impl Stream<Item = std::io::Result<Bytes>> + Send + Unpin,
-    withdrawn: CancellationToken,
+    withdrawn: impl Future<Output = ()> + Send + 'static,
     stop: CancellationToken,
 ) -> impl Stream<Item = std::io::Result<Bytes>> {
+    let withdrawn = Box::pin(withdrawn);
     futures_util::stream::unfold(Some((chunks, withdrawn, stop)), |state| async move {
-        let (mut chunks, withdrawn, stop) = state?;
+        let (mut chunks, mut withdrawn, stop) = state?;
         tokio::select! {
             biased;
-            () = withdrawn.cancelled() => {
+            () = &mut withdrawn => {
                 Some((Err(std::io::Error::other("Item is no longer offered")), None))
             }
             () = stop.cancelled() => {

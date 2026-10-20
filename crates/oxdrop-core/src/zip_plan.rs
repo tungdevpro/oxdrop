@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::{EntryKind, FolderSnapshot, android_safe_name};
+use crate::{EntryKind, FolderSnapshot, Item, ItemKind, android_safe_name};
 
 /// One entry of the zip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,34 +93,30 @@ impl ZipPlan {
         modified: SystemTime,
         snapshot: &FolderSnapshot,
     ) -> Self {
-        let top = android_safe_name(name);
-        let mut entries = vec![ZipEntry {
-            name: format!("{top}/"),
-            modified,
-            file: None,
-        }];
-        for entry in &snapshot.entries {
-            let inner: Vec<String> = entry
-                .relative
-                .components()
-                .map(|part| android_safe_name(&part.as_os_str().to_string_lossy()))
-                .collect();
-            let path = format!("{top}/{}", inner.join("/"));
-            entries.push(match entry.kind {
-                EntryKind::Directory => ZipEntry {
-                    name: format!("{path}/"),
-                    modified: entry.modified,
-                    file: None,
-                },
-                EntryKind::File { size } => ZipEntry {
-                    name: path,
-                    modified: entry.modified,
+        Self::new(folder_entries(name, root, modified, snapshot))
+    }
+
+    /// The zip of a whole Transfer: each Item at the root under its Item Name, a file
+    /// Item as a file and a folder Item as a directory, with names made safe for Android.
+    pub fn for_items(items: &[Item]) -> Self {
+        let mut entries = Vec::new();
+        for item in items {
+            match &item.kind {
+                ItemKind::File => entries.push(ZipEntry {
+                    name: android_safe_name(&item.name),
+                    modified: item.modified,
                     file: Some(ZipFile {
-                        path: root.join(&entry.relative),
-                        size,
+                        path: item.path.clone(),
+                        size: item.size,
                     }),
-                },
-            });
+                }),
+                ItemKind::Folder(snapshot) => entries.extend(folder_entries(
+                    &item.name,
+                    &item.path,
+                    item.modified,
+                    snapshot,
+                )),
+            }
         }
         Self::new(entries)
     }
@@ -262,6 +258,46 @@ impl ZipPlan {
         put16(&mut out, 0); // comment length
         out
     }
+}
+
+/// The entries of a folder named `name` whose files are under `root`, all under a
+/// top-level `name/` directory.
+fn folder_entries(
+    name: &str,
+    root: &Path,
+    modified: SystemTime,
+    snapshot: &FolderSnapshot,
+) -> Vec<ZipEntry> {
+    let top = android_safe_name(name);
+    let mut entries = vec![ZipEntry {
+        name: format!("{top}/"),
+        modified,
+        file: None,
+    }];
+    for entry in &snapshot.entries {
+        let inner: Vec<String> = entry
+            .relative
+            .components()
+            .map(|part| android_safe_name(&part.as_os_str().to_string_lossy()))
+            .collect();
+        let path = format!("{top}/{}", inner.join("/"));
+        entries.push(match entry.kind {
+            EntryKind::Directory => ZipEntry {
+                name: format!("{path}/"),
+                modified: entry.modified,
+                file: None,
+            },
+            EntryKind::File { size } => ZipEntry {
+                name: path,
+                modified: entry.modified,
+                file: Some(ZipFile {
+                    path: root.join(&entry.relative),
+                    size,
+                }),
+            },
+        });
+    }
+    entries
 }
 
 fn is_zip64_size(size: u64) -> bool {

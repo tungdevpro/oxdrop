@@ -25,8 +25,9 @@ Working now:
 - Automatic choice of the network interface the phone can reach, with a dropdown to change it
 - Downloads that resume, and files marked Changed or Missing if they change on disk after you add them
 - Folders, which arrive as one zip that keeps their structure and can be resumed, even with files over 4 GB inside
+- "Download all", which fetches the whole Transfer as one resumable zip, so the browser doesn't ask to allow many downloads
 
-Still to come: Download all, per-Item progress, ending a Transfer (including after being idle), and signed installers.
+Still to come: per-Item progress, ending a Transfer (including after being idle), and signed installers.
 
 ## Building and running
 
