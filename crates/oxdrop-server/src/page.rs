@@ -30,6 +30,8 @@ ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
 .kind { color: var(--muted); font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
 .note { flex-basis: 100%; color: var(--muted); font-size: 14px; }
 .empty { color: var(--muted); padding: 32px 0; text-align: center; }
+.all { display: block; margin: 0 0 16px; padding: 12px 16px; border-radius: 12px; background: var(--accent); color: var(--bg); font-weight: 600; text-align: center; text-decoration: none; }
+.all[hidden] { display: none; }
 </style>
 </head>
 "#;
@@ -39,6 +41,7 @@ const SCRIPT: &str = r#"<script>
 (() => {
   const list = document.getElementById("items");
   const status = document.getElementById("status");
+  const all = document.getElementById("all");
   const span = (cls, text) => {
     const el = document.createElement("span");
     el.className = cls;
@@ -67,6 +70,7 @@ const SCRIPT: &str = r#"<script>
       li.append(row);
       return li;
     }));
+    all.hidden = !items.length;
     status.className = items.length ? "hint" : "empty";
     status.textContent = items.length ? __HINT__ : __EMPTY__;
   });
@@ -74,6 +78,8 @@ const SCRIPT: &str = r#"<script>
 </script>"#;
 
 const HINT: &str = "Tap a file to download it.";
+/// Fetches every Item as one zip, so the browser doesn't ask to allow many downloads.
+const ALL: &str = "Download all";
 const EMPTY: &str = "Nothing here yet. Add files on your computer.";
 /// Marks a folder Item, which downloads as a zip.
 const FOLDER: &str = "Folder · zip";
@@ -148,6 +154,7 @@ pub(crate) fn render(items: &[Item]) -> String {
             } else {
                 p { id: "status", class: "hint", "{HINT}" }
             }
+            a { id: "all", class: "all", href: "all", download: "Oxdrop.zip", hidden: items.is_empty(), "{ALL}" }
             ul { id: "items",
                 for item in items {
                     li { key: "{item.id}",

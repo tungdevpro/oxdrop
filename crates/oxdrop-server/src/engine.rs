@@ -184,6 +184,33 @@ impl Shared {
         }
     }
 
+    /// Rechecks every Item, then hands out what "Download all" serves: every Item as
+    /// snapshotted, and for each a token that is cancelled if that Item is removed or
+    /// refreshed, or the engine stops. Refused if any Item is Changed or Missing.
+    pub(crate) fn start_download_all(
+        &self,
+    ) -> Result<(Vec<Item>, Vec<CancellationToken>), AllRefusal> {
+        let items = self.live().transfer.items().to_vec();
+        if items.is_empty() {
+            return Err(AllRefusal::NoItems);
+        }
+        let unavailable: Vec<String> = items
+            .iter()
+            .zip(self.check(&items))
+            .filter(|(_, status)| *status != ItemStatus::Available)
+            .map(|(item, _)| item.name.clone())
+            .collect();
+        if !unavailable.is_empty() {
+            return Err(AllRefusal::Unavailable(unavailable));
+        }
+        let mut live = self.live();
+        let tokens = items
+            .iter()
+            .map(|item| live.download_token(item.id, &self.shutdown))
+            .collect();
+        Ok((items, tokens))
+    }
+
     /// Marks a Receiver as connected until the returned guard is dropped.
     pub(crate) fn connect_receiver(self: &Arc<Self>) -> ReceiverGuard {
         self.receivers.fetch_add(1, Ordering::SeqCst);
@@ -198,6 +225,14 @@ pub(crate) enum Refusal {
     NoSuchItem,
     /// The Item's file is Changed or Missing.
     Unavailable(ItemStatus),
+}
+
+/// Why "Download all" can't be served right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AllRefusal {
+    NoItems,
+    /// These Items (by Item Name) are Changed or Missing, so not all can be sent.
+    Unavailable(Vec<String>),
 }
 
 pub(crate) struct ReceiverGuard(Arc<Shared>);
