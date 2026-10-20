@@ -26,8 +26,9 @@ Working now:
 - Downloads that resume, and files marked Changed or Missing if they change on disk after you add them
 - Folders, which arrive as one zip that keeps their structure and can be resumed, even with files over 4 GB inside
 - "Download all", which fetches the whole Transfer as one resumable zip, so the browser doesn't ask to allow many downloads
+- Live progress for each Item on the computer, marked Sent when the phone has all of it or Stopped if a download breaks off, including during "Download all" and resumed downloads
 
-Still to come: per-Item progress, ending a Transfer (including after being idle), and signed installers.
+Still to come: ending a Transfer (including after being idle), and signed installers.
 
 ## Building and running
 

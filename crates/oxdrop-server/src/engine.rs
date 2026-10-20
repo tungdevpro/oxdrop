@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use oxdrop_core::{AddError, Added, Item, ItemId, ItemStatus, Transfer, TransferLink};
+use oxdrop_core::{
+    AddError, Added, DownloadTracker, Item, ItemId, ItemStatus, Progress, Transfer, TransferLink,
+};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -17,6 +19,10 @@ use crate::{http, network};
 /// How often the Sender rechecks Items' files, so Changed and Missing show up
 /// without waiting for the Receiver to ask for them.
 const CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often, at most, progress alone is published while bytes are flowing. Starting,
+/// finishing and failing are published straight away.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The port the Sender listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 48230;
@@ -65,12 +71,26 @@ pub struct TransferState {
     pub items: Vec<Item>,
     /// Whether at least one Receiver page is open and listening for updates.
     pub receiver_connected: bool,
+    /// Each Item's progress, for Items that have been downloaded at all.
+    pub progress: HashMap<ItemId, Progress>,
 }
 
-/// The open Transfer plus a cancel switch for each Item's in-flight downloads.
+impl TransferState {
+    /// The Item's progress toward its most recent download.
+    pub fn progress_of(&self, id: ItemId) -> Progress {
+        self.progress
+            .get(&id)
+            .copied()
+            .unwrap_or(Progress::NotStarted)
+    }
+}
+
+/// The open Transfer plus a cancel switch for each Item's in-flight downloads, and how
+/// far each Item's most recent download has got.
 pub(crate) struct Live {
     pub(crate) transfer: Transfer,
     downloads: HashMap<ItemId, CancellationToken>,
+    progress: HashMap<ItemId, DownloadTracker>,
 }
 
 impl Live {
@@ -82,11 +102,12 @@ impl Live {
             .clone()
     }
 
-    /// Aborts the Item's in-flight downloads.
+    /// Aborts the Item's in-flight downloads and forgets their progress.
     fn cancel_downloads(&mut self, id: ItemId) {
         if let Some(downloads) = self.downloads.remove(&id) {
             downloads.cancel();
         }
+        self.progress.remove(&id);
     }
 
     fn remove(&mut self, id: ItemId) -> bool {
@@ -104,6 +125,8 @@ pub(crate) struct Shared {
     receivers: AtomicUsize,
     pub(crate) shutdown: CancellationToken,
     pub(crate) crcs: Arc<CrcCache>,
+    /// When progress alone was last published.
+    progress_published: Mutex<Instant>,
 }
 
 impl Shared {
@@ -125,6 +148,11 @@ impl Shared {
             },
             items: live.transfer.items().to_vec(),
             receiver_connected: self.receivers.load(Ordering::SeqCst) > 0,
+            progress: live
+                .progress
+                .iter()
+                .map(|(id, tracker)| (*id, tracker.progress()))
+                .collect(),
         }
     }
 
@@ -209,6 +237,34 @@ impl Shared {
             .map(|item| live.download_token(item.id, &self.shutdown))
             .collect();
         Ok((items, tokens))
+    }
+
+    /// Records what a response did toward the Item's download, telling subscribers when
+    /// it starts, finishes or fails, and otherwise every so often.
+    pub(crate) fn report(&self, id: ItemId, update: impl FnOnce(&mut DownloadTracker)) {
+        let (before, after) = {
+            let mut live = self.live();
+            if live.transfer.item(id).is_none() {
+                return;
+            }
+            let tracker = live.progress.entry(id).or_default();
+            let before = tracker.progress();
+            update(tracker);
+            (before, tracker.progress())
+        };
+        if before == after {
+            return;
+        }
+        let moved_on = std::mem::discriminant(&before) != std::mem::discriminant(&after);
+        let mut published = self
+            .progress_published
+            .lock()
+            .expect("progress lock poisoned");
+        if moved_on || published.elapsed() >= PROGRESS_INTERVAL {
+            *published = Instant::now();
+            drop(published);
+            self.publish();
+        }
     }
 
     /// Marks a Receiver as connected until the returned guard is dropped.
@@ -326,17 +382,20 @@ impl SenderEngine {
             },
             items: Vec::new(),
             receiver_connected: false,
+            progress: HashMap::new(),
         });
         let shared = Arc::new(Shared {
             address: Mutex::new(address),
             live: Mutex::new(Live {
                 transfer,
                 downloads: HashMap::new(),
+                progress: HashMap::new(),
             }),
             updates,
             receivers: AtomicUsize::new(0),
             shutdown: CancellationToken::new(),
             crcs: Arc::default(),
+            progress_published: Mutex::new(Instant::now()),
         });
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
