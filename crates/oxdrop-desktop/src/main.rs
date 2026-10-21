@@ -3,6 +3,9 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod logging;
+mod update;
+
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +21,7 @@ use oxdrop_core::{IdleState, Item, ItemKind, ItemStatus, Progress, format_size};
 use oxdrop_server::{EngineConfig, SenderEngine, interface_candidates};
 use qrcode::QrCode;
 use qrcode::render::svg;
+use update::Release;
 
 const STYLE: &str = r#"<style>
 :root { --bg: #f6f7f9; --card: #ffffff; --text: #16181d; --muted: #646b78; --accent: #2457d6; --line: #e2e5ea; --problem: #b42318; }
@@ -67,7 +71,10 @@ li.unavailable .name, li.unavailable .size { color: var(--muted); }
 .bar { flex-basis: 100%; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
 .bar span { display: block; height: 100%; background: var(--accent); }
 .bar.failed span { background: var(--problem); }
-.end { width: 100%; margin-top: auto; padding: 7px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--text); font: inherit; font-weight: 600; }
+.trust { margin: auto 0 0; color: var(--muted); font-size: 12px; text-align: center; }
+.logs { padding: 0; border: none; background: none; color: var(--muted); font: inherit; font-size: 12px; text-decoration: underline; }
+.logs:hover { color: var(--text); }
+.end { width: 100%; padding: 7px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--text); font: inherit; font-weight: 600; }
 .end:hover { border-color: var(--problem); color: var(--problem); }
 .banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border: 1px solid var(--accent); border-radius: 10px; background: var(--card); }
 .banner p { flex: 1; margin: 0; }
@@ -84,8 +91,13 @@ struct Engine(Arc<SenderEngine>);
 #[derive(Clone)]
 struct StartupError(String);
 
+/// Where the log file is, if there is one.
+#[derive(Clone)]
+struct LogDir(Option<PathBuf>);
+
 fn main() {
-    let launcher = LaunchBuilder::desktop().with_cfg(
+    let log_dir = LogDir(logging::init());
+    let launcher = LaunchBuilder::desktop().with_context(log_dir).with_cfg(
         Config::new()
             .with_window(
                 WindowBuilder::new()
@@ -99,9 +111,12 @@ fn main() {
     );
     match SenderEngine::start(EngineConfig::default()) {
         Ok(engine) => launcher.with_context(Engine(Arc::new(engine))).launch(App),
-        Err(error) => launcher
-            .with_context(StartupError(error.to_string()))
-            .launch(StartupFailed),
+        Err(error) => {
+            tracing::error!(%error, "can't start the Sender");
+            launcher
+                .with_context(StartupError(error.to_string()))
+                .launch(StartupFailed)
+        }
     }
 }
 
@@ -176,6 +191,11 @@ fn App() -> Element {
         let engine = engine.clone();
         move |_| engine.keep_open()
     };
+    let mut release = use_signal(|| None::<update::Release>);
+    use_future(move || async move {
+        release.set(update::check().await);
+    });
+    let LogDir(log_dir) = use_context::<LogDir>();
     let link = use_memo(move || state.read().link.to_string());
     let qr = use_memo(move || qr_svg(&link()));
 
@@ -224,6 +244,17 @@ fn App() -> Element {
                     span { class: "dot" }
                     if connected { "Phone connected" } else { "Waiting for phone…" }
                 }
+                p { class: "trust",
+                    "Use Oxdrop only on networks you trust: transfers aren't encrypted."
+                }
+                if let Some(dir) = log_dir {
+                    button {
+                        class: "logs",
+                        title: "{dir.display()}",
+                        onclick: move |_| logging::reveal(&dir.to_string_lossy()),
+                        "Show log folder"
+                    }
+                }
                 button {
                     class: "end",
                     title: "Stop the QR code working and start a new, empty Transfer",
@@ -232,6 +263,13 @@ fn App() -> Element {
                 }
             }
             section { class: "items",
+                if let Some(Release { tag, url }) = release() {
+                    div { class: "banner",
+                        p { "Oxdrop {tag} is available." }
+                        button { class: "primary", onclick: move |_| logging::reveal(&url), "Download" }
+                        button { title: "Dismiss", onclick: move |_| release.set(None), "×" }
+                    }
+                }
                 if confirm_close() {
                     div { class: "banner ask",
                         p { "A download is in progress. End the Transfer and quit?" }

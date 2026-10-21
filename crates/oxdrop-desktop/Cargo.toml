@@ -15,4 +15,12 @@ oxdrop-core.workspace = true
 oxdrop-server.workspace = true
 dioxus = { workspace = true, features = ["default", "desktop"] }
 qrcode.workspace = true
+# Only for the update check, over the OS's own TLS.
+reqwest = { workspace = true, features = ["native-tls"] }
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true

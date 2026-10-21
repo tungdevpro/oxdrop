@@ -41,6 +41,17 @@ cargo run -p oxdrop-desktop
 
 The Sender listens on port **48230**. If that port is busy, it uses one the OS picks and shows it in the Transfer Link. The first time you run it, allow it through the firewall so the phone can connect.
 
+## Logs and privacy
+
+Oxdrop has no telemetry. It keeps a local log, which you can attach to a bug report. Click "Show log folder" in the app to find it:
+
+- macOS: `~/Library/Logs/Oxdrop`
+- Windows: `%LOCALAPPDATA%\Oxdrop\logs`
+
+The log rolls over daily, and the last 7 days are kept. If the app crashes, the crash message and backtrace are written there too.
+
+On launch, Oxdrop makes one anonymous request to the GitHub Releases API to see whether a newer version exists. If one does, it shows a notice linking to the release. Apart from the local network, this is the only connection the app makes. If the request fails, the app says nothing.
+
 ## Development
 
 ```sh
