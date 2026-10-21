@@ -53,11 +53,9 @@ try {
         Invoke-WebRequest "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $webview2
     }
 
-    $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
-    if (-not $makensis) {
-        $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
-        if (-not (Test-Path $makensis)) { throw "makensis not found; install NSIS 3" }
-    }
+    $command = Get-Command makensis -ErrorAction SilentlyContinue
+    $makensis = if ($command) { $command.Source } else { "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
+    if (-not (Test-Path $makensis)) { throw "makensis not found; install NSIS 3" }
     Invoke-Checked $makensis /V3 /INPUTCHARSET UTF8 `
         "/DVERSION=$version" "/DARCH=$Arch" "/DBINARY=$root\$binary" `
         "/DWEBVIEW2=$root\$webview2" "/DROOT=$root" "/DOUTFILE=$root\$installer" `
