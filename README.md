@@ -29,7 +29,19 @@ Working now:
 - Live progress for each Item on the computer, marked Sent when the phone has all of it or Stopped if a download breaks off, including during "Download all" and resumed downloads
 - Ending a Transfer with End Transfer, by closing the window, or after 30 minutes with no activity (with a 2-minute countdown and Keep open). The old QR code then shows "This Transfer has ended", and a fresh one is ready straight away
 
-Still to come: signed installers.
+Releases are built for macOS (universal) and Windows (x64 and ARM64). They are unsigned until signing credentials are set up.
+
+## Installing
+
+Download the installer for your computer from [Releases](https://github.com/tungdevpro/oxdrop/releases):
+
+- **macOS 12 or later** (Apple Silicon or Intel): open `Oxdrop-<version>-macos-universal.dmg` and drag Oxdrop to Applications.
+- **Windows 10 21H2 or later**: run `Oxdrop-<version>-windows-x64-setup.exe`, or the `arm64` one on an ARM PC. It installs for your user account, with no administrator rights needed, and installs Microsoft's WebView2 runtime first if the PC doesn't have it.
+
+Until the builds are signed, your computer will warn you the first time you open Oxdrop:
+
+- **macOS:** right-click Oxdrop in Applications, choose **Open**, then **Open** again. On macOS 15 and later, open **System Settings → Privacy & Security** instead and click **Open Anyway**.
+- **Windows:** when SmartScreen says "Windows protected your PC", click **More info**, then **Run anyway**.
 
 ## Building and running
 
@@ -72,6 +84,26 @@ The HTTP tests in `crates/oxdrop-server/tests/` start a real engine on loopback 
 
 Issues are tracked in [GitHub Issues](https://github.com/tungdevpro/oxdrop/issues).
 
+## Releasing
+
+1. Set the new `version` in the root `Cargo.toml` and commit it.
+2. Push a matching tag, such as `git tag v0.2.0 && git push origin v0.2.0`.
+
+The [Release workflow](.github/workflows/release.yml) checks that the tag matches the version, builds the macOS `.dmg` and both Windows installers, and attaches them to a **draft** GitHub Release. Install them by hand on macOS and Windows, then publish the draft. The app's update notice only sees published releases.
+
+To build the installers without releasing, run the workflow by hand from the Actions tab. It also runs on pull requests that change `scripts/` or the workflow. To build the macOS `.dmg` locally, run `./scripts/macos/package.sh`. On Windows, run `.\scripts\windows\package.ps1 -Arch x64`, which needs [NSIS](https://nsis.sourceforge.io/) 3.
+
+Signing is optional. Each step runs only when its repository secrets are set; without them, the workflow still succeeds and produces unsigned installers.
+
+| Secret | Used for |
+|---|---|
+| `MACOS_CERTIFICATE` | The "Developer ID Application" certificate and its private key, as a base64-encoded `.p12` |
+| `MACOS_CERTIFICATE_PASSWORD` | The `.p12` file's password |
+| `MACOS_SIGNING_IDENTITY` | The identity to sign with, such as `Developer ID Application: Name (TEAMID)` |
+| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | Notarization: the Apple ID, its team ID, and an [app-specific password](https://support.apple.com/102654). Used only when the app is signed. |
+| `WINDOWS_CERTIFICATE` | A code-signing certificate and its private key, as a base64-encoded `.pfx` |
+| `WINDOWS_CERTIFICATE_PASSWORD` | The `.pfx` file's password |
+
 ## License
 
-Licensed under either of MIT or Apache-2.0, at your option.
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
