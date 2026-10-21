@@ -17,9 +17,7 @@ See [`CONTEXT.md`](CONTEXT.md) for the vocabulary (Sender, Receiver, Transfer, I
 
 ## Status
 
-Oxdrop is in development and not yet released. The v1 plan is [issue #1](https://github.com/tungdevpro/oxdrop/issues/1).
-
-Working now:
+**Oxdrop 0.1.0** is out: [download it from Releases](https://github.com/tungdevpro/oxdrop/releases/latest). It covers the whole v1 plan from [issue #1](https://github.com/tungdevpro/oxdrop/issues/1):
 
 - Several files at once, a phone page that updates live, and a "phone connected" indicator
 - Automatic choice of the network interface the phone can reach, with a dropdown to change it
@@ -28,8 +26,9 @@ Working now:
 - "Download all", which fetches the whole Transfer as one resumable zip, so the browser doesn't ask to allow many downloads
 - Live progress for each Item on the computer, marked Sent when the phone has all of it or Stopped if a download breaks off, including during "Download all" and resumed downloads
 - Ending a Transfer with End Transfer, by closing the window, or after 30 minutes with no activity (with a 2-minute countdown and Keep open). The old QR code then shows "This Transfer has ended", and a fresh one is ready straight away
+- A note to use Oxdrop only on networks you trust, a local log for bug reports, and a notice when a newer version is out
 
-Releases are built for macOS (universal) and Windows (x64 and ARM64). They are unsigned until signing credentials are set up.
+Builds are for macOS 12 or later (universal) and Windows 10 21H2 or later (x64 and ARM64). They aren't signed yet, so the first time you open Oxdrop your computer will warn you; see [Installing](#installing).
 
 ## Installing
 
