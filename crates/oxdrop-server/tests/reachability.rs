@@ -66,6 +66,7 @@ async fn a_taken_port_falls_back_to_a_free_one_shown_in_the_link() {
     let h = Harness::start(EngineConfig {
         bind: BindAddress::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         port: taken,
+        ..EngineConfig::default()
     });
 
     let port = h.engine.state().link.address.port();
@@ -86,6 +87,7 @@ async fn a_free_port_is_used_as_asked() {
     let h = Harness::start(EngineConfig {
         bind: BindAddress::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         port: free,
+        ..EngineConfig::default()
     });
 
     assert_eq!(h.engine.state().link.address.port(), free);
@@ -96,6 +98,7 @@ async fn switching_interface_moves_the_link_and_keeps_the_secret() {
     let h = Harness::start(EngineConfig {
         bind: BindAddress::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
         port: 0,
+        ..EngineConfig::default()
     });
     h.add_file("notes.txt", b"hello");
     let before = h.engine.state().link;

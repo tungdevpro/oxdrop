@@ -8,11 +8,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use oxdrop_core::{
-    AddError, Added, DownloadTracker, Item, ItemId, ItemStatus, Progress, Transfer, TransferLink,
+    AddError, Added, DownloadTracker, IdleState, IdleTimer, Item, ItemId, ItemStatus, Progress,
+    Transfer, TransferLink, TransferSecret,
 };
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::clock::{Clock, SystemClock};
 use crate::zip_stream::CrcCache;
 use crate::{http, network};
 
@@ -40,6 +42,11 @@ pub struct EngineConfig {
     pub bind: BindAddress,
     /// `0` lets the OS choose.
     pub port: u16,
+    /// How long a Transfer may go without activity before it ends.
+    pub idle_timeout: Duration,
+    /// How long before the idle deadline the Sender starts warning.
+    pub warning_lead: Duration,
+    pub clock: Arc<dyn Clock>,
 }
 
 impl Default for EngineConfig {
@@ -47,6 +54,9 @@ impl Default for EngineConfig {
         Self {
             bind: BindAddress::Auto,
             port: DEFAULT_PORT,
+            idle_timeout: Duration::from_secs(30 * 60),
+            warning_lead: Duration::from_secs(2 * 60),
+            clock: Arc::new(SystemClock),
         }
     }
 }
@@ -73,6 +83,8 @@ pub struct TransferState {
     pub receiver_connected: bool,
     /// Each Item's progress, for Items that have been downloaded at all.
     pub progress: HashMap<ItemId, Progress>,
+    /// When the Transfer ends if left alone, and whether to warn about it.
+    pub idle: IdleState,
 }
 
 impl TransferState {
@@ -85,20 +97,29 @@ impl TransferState {
     }
 }
 
-/// The open Transfer plus a cancel switch for each Item's in-flight downloads, and how
-/// far each Item's most recent download has got.
+/// The open Transfer plus a cancel switch for each Item's in-flight downloads, how far
+/// each Item's most recent download has got, and how long until it goes idle.
 pub(crate) struct Live {
     pub(crate) transfer: Transfer,
+    /// Counts the Transfers opened, so a response from an ended one can tell.
+    generation: u64,
+    /// Cancelled when the Transfer ends (or the engine stops).
+    ended: CancellationToken,
+    /// The secret of the Transfer that ended last, which gets "ended" rather than 404.
+    last_ended: Option<TransferSecret>,
     downloads: HashMap<ItemId, CancellationToken>,
     progress: HashMap<ItemId, DownloadTracker>,
+    idle: IdleTimer,
 }
 
 impl Live {
-    /// A token that is cancelled if the Item is removed or refreshed, or the engine stops.
-    fn download_token(&mut self, id: ItemId, shutdown: &CancellationToken) -> CancellationToken {
+    /// A token that is cancelled if the Item is removed or refreshed, the Transfer ends,
+    /// or the engine stops.
+    fn download_token(&mut self, id: ItemId) -> CancellationToken {
+        let ended = &self.ended;
         self.downloads
             .entry(id)
-            .or_insert_with(|| shutdown.child_token())
+            .or_insert_with(|| ended.child_token())
             .clone()
     }
 
@@ -127,6 +148,21 @@ pub(crate) struct Shared {
     pub(crate) crcs: Arc<CrcCache>,
     /// When progress alone was last published.
     progress_published: Mutex<Instant>,
+    clock: Arc<dyn Clock>,
+    idle_timeout: Duration,
+    warning_lead: Duration,
+    /// Wakes the idle watcher when activity may have moved the deadline.
+    activity: Notify,
+}
+
+/// What a secret in a request opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// The open Transfer.
+    Open,
+    /// The Transfer that ended last.
+    Ended,
+    Unknown,
 }
 
 impl Shared {
@@ -153,6 +189,7 @@ impl Shared {
                 .iter()
                 .map(|(id, tracker)| (*id, tracker.progress()))
                 .collect(),
+            idle: live.idle.state(self.clock.now()),
         }
     }
 
@@ -205,7 +242,7 @@ impl Shared {
             .ok_or(Refusal::NoSuchItem)?;
         match self.check(std::slice::from_ref(&item))[0] {
             ItemStatus::Available => {
-                let token = self.live().download_token(id, &self.shutdown);
+                let token = self.live().download_token(id);
                 Ok((item, token))
             }
             status => Err(Refusal::Unavailable(status)),
@@ -234,17 +271,23 @@ impl Shared {
         let mut live = self.live();
         let tokens = items
             .iter()
-            .map(|item| live.download_token(item.id, &self.shutdown))
+            .map(|item| live.download_token(item.id))
             .collect();
         Ok((items, tokens))
     }
 
     /// Records what a response did toward the Item's download, telling subscribers when
     /// it starts, finishes or fails, and otherwise every so often.
-    pub(crate) fn report(&self, id: ItemId, update: impl FnOnce(&mut DownloadTracker)) {
+    /// Ignored if the Transfer it was served from (`generation`) has ended.
+    pub(crate) fn report(
+        &self,
+        generation: u64,
+        id: ItemId,
+        update: impl FnOnce(&mut DownloadTracker),
+    ) {
         let (before, after) = {
             let mut live = self.live();
-            if live.transfer.item(id).is_none() {
+            if live.generation != generation || live.transfer.item(id).is_none() {
                 return;
             }
             let tracker = live.progress.entry(id).or_default();
@@ -264,6 +307,121 @@ impl Shared {
             *published = Instant::now();
             drop(published);
             self.publish();
+        }
+    }
+
+    /// Whether `secret` opens the open Transfer, the one that ended last, or nothing.
+    /// Admitting a request to the open Transfer counts as activity.
+    pub(crate) fn admit(&self, secret: &str) -> Admission {
+        let admission = {
+            let live = self.live();
+            if live.transfer.secret().matches(secret) {
+                Admission::Open
+            } else if live
+                .last_ended
+                .as_ref()
+                .is_some_and(|ended| ended.matches(secret))
+            {
+                Admission::Ended
+            } else {
+                Admission::Unknown
+            }
+        };
+        if admission == Admission::Open {
+            self.touch();
+        }
+        admission
+    }
+
+    /// Something counting as activity happened just now.
+    fn touch(&self) {
+        let now = self.clock.now();
+        self.live().idle.touch(now);
+        self.activity.notify_one();
+    }
+
+    /// A download response starts streaming; it counts as activity until
+    /// [`stream_ended`](Self::stream_ended). Returns the Transfer it belongs to.
+    pub(crate) fn stream_started(&self) -> u64 {
+        let now = self.clock.now();
+        let generation = {
+            let mut live = self.live();
+            live.idle.stream_started(now);
+            live.generation
+        };
+        self.activity.notify_one();
+        generation
+    }
+
+    /// A download response of Transfer `generation` stopped streaming.
+    pub(crate) fn stream_ended(&self, generation: u64) {
+        let now = self.clock.now();
+        {
+            let mut live = self.live();
+            if live.generation != generation {
+                return;
+            }
+            live.idle.stream_ended(now);
+        }
+        self.activity.notify_one();
+    }
+
+    /// A token cancelled when the open Transfer ends, or the engine stops.
+    pub(crate) fn ended_token(&self) -> CancellationToken {
+        self.live().ended.clone()
+    }
+
+    /// Ends the open Transfer, cutting off its downloads and event streams so its
+    /// Transfer Link stops working, and opens a fresh, empty one with a new secret.
+    fn end_transfer(&self) {
+        let now = self.clock.now();
+        {
+            let mut live = self.live();
+            let ended = std::mem::replace(&mut live.transfer, Transfer::open());
+            live.last_ended = Some(ended.secret().clone());
+            live.generation += 1;
+            live.ended.cancel();
+            live.ended = self.shutdown.child_token();
+            live.downloads.clear();
+            live.progress.clear();
+            live.idle = IdleTimer::new(now, self.idle_timeout, self.warning_lead);
+        }
+        tracing::info!("Transfer ended; a fresh one is open");
+        self.publish();
+        self.activity.notify_one();
+    }
+
+    /// Ends the Transfer once its idle deadline passes, telling subscribers when the
+    /// warning starts. Runs until the engine stops.
+    async fn watch_idle(&self) {
+        let mut shown = None;
+        loop {
+            let now = self.clock.now();
+            let (state, next) = {
+                let live = self.live();
+                (live.idle.state(now), live.idle.next_change(now))
+            };
+            if state == IdleState::Expired {
+                self.end_transfer();
+                continue;
+            }
+            // Publish when the countdown starts, stops or moves; not for every request.
+            let warning = matches!(state, IdleState::Warning { .. }).then_some(state);
+            if warning != shown {
+                shown = warning;
+                self.publish();
+            }
+            let wake = async {
+                match next {
+                    Some(at) => self.clock.sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                () = self.shutdown.cancelled() => break,
+                () = self.activity.notified() => {}
+                () = wake => {}
+            }
         }
     }
 
@@ -375,6 +533,7 @@ impl SenderEngine {
         let address = listener.local_addr().map_err(StartError::Runtime)?;
 
         let transfer = Transfer::open();
+        let idle = IdleTimer::new(config.clock.now(), config.idle_timeout, config.warning_lead);
         let (updates, _) = watch::channel(TransferState {
             link: TransferLink {
                 address,
@@ -383,19 +542,29 @@ impl SenderEngine {
             items: Vec::new(),
             receiver_connected: false,
             progress: HashMap::new(),
+            idle: idle.state(config.clock.now()),
         });
+        let shutdown = CancellationToken::new();
         let shared = Arc::new(Shared {
             address: Mutex::new(address),
             live: Mutex::new(Live {
                 transfer,
+                generation: 0,
+                ended: shutdown.child_token(),
+                last_ended: None,
                 downloads: HashMap::new(),
                 progress: HashMap::new(),
+                idle,
             }),
             updates,
             receivers: AtomicUsize::new(0),
-            shutdown: CancellationToken::new(),
+            shutdown,
             crcs: Arc::default(),
             progress_published: Mutex::new(Instant::now()),
+            clock: config.clock,
+            idle_timeout: config.idle_timeout,
+            warning_lead: config.warning_lead,
+            activity: Notify::new(),
         });
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -418,6 +587,10 @@ impl SenderEngine {
                 }
             }
         });
+        handle.spawn({
+            let shared = shared.clone();
+            async move { shared.watch_idle().await }
+        });
         let shutdown = shared.shutdown.clone();
         // The runtime lives on its own thread so the engine can be dropped anywhere,
         // including inside another runtime.
@@ -438,6 +611,7 @@ impl SenderEngine {
     /// Listens on `ip` instead, so the Transfer Link points there. The Transfer and its
     /// secret are unchanged. If `ip` can't be bound, the Sender keeps listening where it was.
     pub fn switch_interface(&self, ip: IpAddr) -> Result<(), StartError> {
+        self.shared.touch();
         let mut serving = self.serving.lock().expect("serving lock poisoned");
         if self.shared.address().ip() == ip {
             return Ok(());
@@ -463,6 +637,7 @@ impl SenderEngine {
 
     /// Adds the file at `path` to the open Transfer as an Item.
     pub fn add_path(&self, path: &Path) -> Result<Added, AddError> {
+        self.shared.touch();
         let added = self.shared.live().transfer.add_path(path);
         if matches!(added, Ok(Added::New(_))) {
             self.shared.publish();
@@ -472,6 +647,7 @@ impl SenderEngine {
 
     /// Adds several paths at once; the outcomes are in the same order as `paths`.
     pub fn add_paths(&self, paths: &[PathBuf]) -> Vec<Result<Added, AddError>> {
+        self.shared.touch();
         let outcomes: Vec<_> = {
             let mut live = self.shared.live();
             paths
@@ -494,6 +670,7 @@ impl SenderEngine {
     /// downloads of the previous version. Returns whether there was such an Item.
     /// If the file can't be read, the Item stays Missing and the error says why.
     pub fn refresh_item(&self, id: ItemId) -> Result<bool, AddError> {
+        self.shared.touch();
         let refreshed = {
             let mut live = self.shared.live();
             live.cancel_downloads(id);
@@ -507,11 +684,25 @@ impl SenderEngine {
 
     /// Removes an Item and aborts its in-flight downloads. Returns whether it was there.
     pub fn remove_item(&self, id: ItemId) -> bool {
+        self.shared.touch();
         let removed = self.shared.live().remove(id);
         if removed {
             self.shared.publish();
         }
         removed
+    }
+}
+
+impl SenderEngine {
+    /// Ends the open Transfer: its Transfer Link stops working, its downloads are cut off
+    /// and open Receiver pages are told. A fresh, empty Transfer with a new link opens.
+    pub fn end_transfer(&self) {
+        self.shared.end_transfer();
+    }
+
+    /// Counts as activity, putting the idle deadline off again ("Keep open").
+    pub fn keep_open(&self) {
+        self.shared.touch();
     }
 }
 

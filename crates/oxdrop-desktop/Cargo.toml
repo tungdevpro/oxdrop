@@ -15,3 +15,4 @@ oxdrop-core.workspace = true
 oxdrop-server.workspace = true
 dioxus = { workspace = true, features = ["default", "desktop"] }
 qrcode.workspace = true
+tokio = { workspace = true, features = ["time"] }

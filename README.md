@@ -27,8 +27,9 @@ Working now:
 - Folders, which arrive as one zip that keeps their structure and can be resumed, even with files over 4 GB inside
 - "Download all", which fetches the whole Transfer as one resumable zip, so the browser doesn't ask to allow many downloads
 - Live progress for each Item on the computer, marked Sent when the phone has all of it or Stopped if a download breaks off, including during "Download all" and resumed downloads
+- Ending a Transfer with End Transfer, by closing the window, or after 30 minutes with no activity (with a 2-minute countdown and Keep open). The old QR code then shows "This Transfer has ended", and a fresh one is ready straight away
 
-Still to come: ending a Transfer (including after being idle), and signed installers.
+Still to come: signed installers.
 
 ## Building and running
 
