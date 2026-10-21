@@ -1,0 +1,143 @@
+name: Release
+
+# A version tag (v1.2.3, matching the crate version) builds every installer and attaches
+# them to a draft GitHub Release, to publish once they've been checked by hand. Running
+# the workflow by hand, or a pull request that changes the packaging, builds the same
+# installers as workflow artifacts and publishes nothing.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/**"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ $GITHUB_REF_TYPE == tag && $GITHUB_REF_NAME != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match the crate version $version"
+            exit 1
+          fi
+
+  macos:
+    name: macOS (universal)
+    needs: version
+    runs-on: macos-latest # Apple Silicon
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Import the signing certificate
+        if: env.MACOS_CERTIFICATE != '' && env.MACOS_SIGNING_IDENTITY != ''
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -base64 24)
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/certificate.p12"
+      - name: Without a certificate, don't try to sign
+        if: env.MACOS_CERTIFICATE == '' || env.MACOS_SIGNING_IDENTITY == ''
+        run: echo "MACOS_SIGNING_IDENTITY=" >> "$GITHUB_ENV"
+      - run: ./scripts/macos/package.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: target/package/*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    # Both are built on x64; ARM64 is cross-compiled with the MSVC ARM64 tools.
+    runs-on: windows-latest
+    env:
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Make sure NSIS is installed
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis --no-progress -y
+          }
+      - run: .\scripts\windows\package.ps1 -Arch ${{ matrix.arch }}
+        shell: pwsh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-${{ matrix.arch }}
+          path: target/package/*.exe
+          if-no-files-found: error
+
+  release:
+    name: Draft the GitHub Release
+    if: github.ref_type == 'tag'
+    needs: [version, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "Oxdrop ${{ needs.version.outputs.version }}" \
+            --generate-notes
