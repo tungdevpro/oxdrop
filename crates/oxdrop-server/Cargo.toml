@@ -18,7 +18,7 @@ percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "fs", "io-util", "sync", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "fs", "io-util", "sync", "macros", "time"] }
 tokio-stream.workspace = true
 tokio-util = { workspace = true, features = ["io", "rt"] }
 tracing.workspace = true

@@ -3132,6 +3132,7 @@ dependencies = [
  "oxdrop-core",
  "oxdrop-server",
  "qrcode",
+ "tokio",
 ]
 
 [[package]]

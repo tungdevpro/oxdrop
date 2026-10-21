@@ -19,7 +19,7 @@ use tokio_stream::wrappers::WatchStream;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::{AllRefusal, Refusal, Shared};
+use crate::engine::{Admission, AllRefusal, Refusal, Shared};
 use crate::page::{self, ReceiverView};
 use crate::range::Requested;
 use crate::tracked::{ByteStream, Share, Tracked};
@@ -72,20 +72,43 @@ async fn require_bound_host(
     }
 }
 
-/// Rejects anything not carrying the open Transfer's secret with a plain 404,
-/// so a wrong secret is indistinguishable from a path that doesn't exist.
-fn check_secret(shared: &Shared, secret: &str) -> Result<(), StatusCode> {
-    if shared.live().transfer.secret().matches(secret) {
-        Ok(())
-    } else {
-        Err(StatusCode::NOT_FOUND)
+/// Why a request goes no further.
+enum Rejection {
+    Status(StatusCode),
+    /// It carries the secret of the Transfer that ended last.
+    Ended,
+}
+
+impl From<StatusCode> for Rejection {
+    fn from(status: StatusCode) -> Self {
+        Self::Status(status)
+    }
+}
+
+impl IntoResponse for Rejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Status(status) => status.into_response(),
+            Self::Ended => (StatusCode::GONE, Html(page::render_ended())).into_response(),
+        }
+    }
+}
+
+/// Rejects anything not carrying the open Transfer's secret with a plain 404, so a
+/// wrong secret is indistinguishable from a path that doesn't exist. The Transfer that
+/// ended last says so instead, so a Receiver still holding its link knows why.
+fn check_secret(shared: &Shared, secret: &str) -> Result<(), Rejection> {
+    match shared.admit(secret) {
+        Admission::Open => Ok(()),
+        Admission::Ended => Err(Rejection::Ended),
+        Admission::Unknown => Err(StatusCode::NOT_FOUND.into()),
     }
 }
 
 async fn add_trailing_slash(
     State(shared): State<Arc<Shared>>,
     Path(secret): Path<String>,
-) -> Result<Redirect, StatusCode> {
+) -> Result<Redirect, Rejection> {
     check_secret(&shared, &secret)?;
     Ok(Redirect::permanent(&format!("/t/{secret}/")))
 }
@@ -93,20 +116,22 @@ async fn add_trailing_slash(
 async fn receiver_page(
     State(shared): State<Arc<Shared>>,
     Path(secret): Path<String>,
-) -> Result<Html<String>, StatusCode> {
+) -> Result<Html<String>, Rejection> {
     check_secret(&shared, &secret)?;
     let items = shared.live().transfer.items().to_vec();
     Ok(Html(page::render(&items)))
 }
 
 /// Server-sent `transfer` events carrying the Receiver's view of the Transfer: the
-/// current view first, then a new one whenever it changes. An open stream is what
-/// "Receiver connected" means.
+/// current view first, then a new one whenever it changes. When the Transfer ends, an
+/// `ended` event and the stream closes. An open stream is what "Receiver connected"
+/// means; it isn't activity, so a page left open doesn't keep the Transfer from idling.
 async fn events(
     State(Listening { shared, stop, .. }): State<Listening>,
     Path(secret): Path<String>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Rejection> {
     check_secret(&shared, &secret)?;
+    let ended = shared.ended_token();
     let connected = shared.connect_receiver();
     let mut last_sent = None;
     let stream = WatchStream::new(shared.subscribe())
@@ -120,7 +145,20 @@ async fn events(
             });
             std::future::ready(event)
         })
-        .take_until(stop.cancelled_owned());
+        .take_until({
+            let ended = ended.clone();
+            async move {
+                tokio::select! {
+                    () = stop.cancelled() => {}
+                    () = ended.cancelled() => {}
+                }
+            }
+        })
+        .chain(
+            futures_util::stream::once(async move { ended.is_cancelled() }).filter_map(|ended| {
+                std::future::ready(ended.then(|| Ok(Event::default().event("ended").data("{}"))))
+            }),
+        );
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
@@ -129,12 +167,12 @@ async fn download_item(
     Path((secret, item_id)): Path<(String, String)>,
     method: Method,
     headers: HeaderMap,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, Rejection> {
     check_secret(&shared, &secret)?;
     let id: ItemId = item_id.parse().map_err(|_| StatusCode::NOT_FOUND)?;
     let (item, cancelled) = match shared.start_download(id) {
         Ok(download) => download,
-        Err(Refusal::NoSuchItem) => return Err(StatusCode::NOT_FOUND),
+        Err(Refusal::NoSuchItem) => return Err(StatusCode::NOT_FOUND.into()),
         Err(Refusal::Unavailable(status)) => return Ok(unavailable(status)),
     };
     let withdrawn = cancelled.cancelled_owned();
@@ -202,11 +240,11 @@ async fn download_all(
     Path(secret): Path<String>,
     method: Method,
     headers: HeaderMap,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, Rejection> {
     check_secret(&shared, &secret)?;
     let (items, tokens) = match shared.start_download_all() {
         Ok(download) => download,
-        Err(AllRefusal::NoItems) => return Err(StatusCode::NOT_FOUND),
+        Err(AllRefusal::NoItems) => return Err(StatusCode::NOT_FOUND.into()),
         Err(AllRefusal::Unavailable(names)) => return Ok(some_unavailable(&names)),
     };
     // Withdrawing any one of the Items withdraws the whole zip.

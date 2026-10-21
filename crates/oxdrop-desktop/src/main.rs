@@ -6,11 +6,15 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
+use dioxus::desktop::tao::event::{Event, WindowEvent};
+use dioxus::desktop::{
+    Config, LogicalSize, WindowBuilder, WindowCloseBehaviour, use_window, use_wry_event_handler,
+};
 use dioxus::html::HasFileData;
 use dioxus::prelude::*;
-use oxdrop_core::{Item, ItemKind, ItemStatus, Progress, format_size};
+use oxdrop_core::{IdleState, Item, ItemKind, ItemStatus, Progress, format_size};
 use oxdrop_server::{EngineConfig, SenderEngine, interface_candidates};
 use qrcode::QrCode;
 use qrcode::render::svg;
@@ -63,6 +67,14 @@ li.unavailable .name, li.unavailable .size { color: var(--muted); }
 .bar { flex-basis: 100%; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
 .bar span { display: block; height: 100%; background: var(--accent); }
 .bar.failed span { background: var(--problem); }
+.end { width: 100%; margin-top: auto; padding: 7px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--text); font: inherit; font-weight: 600; }
+.end:hover { border-color: var(--problem); color: var(--problem); }
+.banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border: 1px solid var(--accent); border-radius: 10px; background: var(--card); }
+.banner p { flex: 1; margin: 0; }
+.banner.ask { border-color: var(--problem); }
+.banner button { flex: none; padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--text); font: inherit; font-weight: 600; }
+.banner button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.banner.ask button.primary { border-color: var(--problem); background: var(--problem); }
 .interface select { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
 </style>"#;
 
@@ -81,7 +93,9 @@ fn main() {
                     .with_inner_size(LogicalSize::new(780.0, 520.0))
                     .with_min_inner_size(LogicalSize::new(600.0, 400.0)),
             )
-            .with_custom_head(STYLE.to_owned()),
+            .with_custom_head(STYLE.to_owned())
+            // Closing is decided in `App`: hidden (and shown again) while it asks first.
+            .with_close_behaviour(WindowCloseBehaviour::WindowHides),
     );
     match SenderEngine::start(EngineConfig::default()) {
         Ok(engine) => launcher.with_context(Engine(Arc::new(engine))).launch(App),
@@ -113,6 +127,55 @@ fn App() -> Element {
     });
     let mut problem = use_signal(|| None::<String>);
     let mut dragging = use_signal(|| false);
+    // Whether closing is waiting for the user to confirm cutting off a download.
+    let mut confirm_close = use_signal(|| false);
+    let window = use_window();
+    use_wry_event_handler({
+        let engine = engine.clone();
+        let window = window.clone();
+        move |event, _| {
+            let Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } = event
+            else {
+                return;
+            };
+            if state.peek().idle == IdleState::Busy {
+                // The window hides now; bring it straight back and ask.
+                window.set_close_behavior(WindowCloseBehaviour::WindowHides);
+                confirm_close.set(true);
+                let window = window.clone();
+                spawn(async move {
+                    window.set_visible(true);
+                    window.set_focus();
+                });
+            } else {
+                engine.end_transfer();
+                window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+            }
+        }
+    });
+    let end_and_quit = {
+        let engine = engine.clone();
+        let window = window.clone();
+        move |_| {
+            engine.end_transfer();
+            window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+            window.close();
+        }
+    };
+    let end_transfer = {
+        let engine = engine.clone();
+        move |_| {
+            engine.end_transfer();
+            problem.set(None);
+        }
+    };
+    let keep_open = {
+        let engine = engine.clone();
+        move |_| engine.keep_open()
+    };
     let link = use_memo(move || state.read().link.to_string());
     let qr = use_memo(move || qr_svg(&link()));
 
@@ -142,6 +205,7 @@ fn App() -> Element {
 
     let items = state.read().items.clone();
     let connected = state.read().receiver_connected;
+    let idle = state.read().idle;
     rsx! {
         div {
             class: if dragging() { "app dragging" } else { "app" },
@@ -160,8 +224,27 @@ fn App() -> Element {
                     span { class: "dot" }
                     if connected { "Phone connected" } else { "Waiting for phone…" }
                 }
+                button {
+                    class: "end",
+                    title: "Stop the QR code working and start a new, empty Transfer",
+                    onclick: end_transfer,
+                    "End Transfer"
+                }
             }
             section { class: "items",
+                if confirm_close() {
+                    div { class: "banner ask",
+                        p { "A download is in progress. End the Transfer and quit?" }
+                        button { onclick: move |_| confirm_close.set(false), "Keep sending" }
+                        button { class: "primary", onclick: end_and_quit, "End and quit" }
+                    }
+                }
+                if let IdleState::Warning { deadline } = idle {
+                    div { class: "banner",
+                        Countdown { deadline }
+                        button { class: "primary", onclick: keep_open, "Keep open" }
+                    }
+                }
                 div { class: "toolbar",
                     label { class: "button",
                         "Add files…"
@@ -208,6 +291,22 @@ fn App() -> Element {
                 }
             }
         }
+    }
+}
+
+/// "Ending in 1:45", counting down to the idle deadline.
+#[component]
+fn Countdown(deadline: Instant) -> Element {
+    let mut now = use_signal(Instant::now);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            now.set(Instant::now());
+        }
+    });
+    let left = deadline.saturating_duration_since(now()).as_secs();
+    rsx! {
+        p { "No activity: this Transfer ends in {left / 60}:{left % 60:02} and its QR code stops working." }
     }
 }
 

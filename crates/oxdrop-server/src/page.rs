@@ -74,6 +74,15 @@ const SCRIPT: &str = r#"<script>
     status.className = items.length ? "hint" : "empty";
     status.textContent = items.length ? __HINT__ : __EMPTY__;
   });
+  events.addEventListener("ended", () => {
+    events.close();
+    const title = document.createElement("h1");
+    title.textContent = __ENDED__;
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    hint.textContent = __ENDED_HINT__;
+    document.querySelector("main").replaceChildren(title, hint);
+  });
 })();
 </script>"#;
 
@@ -144,6 +153,20 @@ impl ReceiverView {
     }
 }
 
+const ENDED: &str = "This Transfer has ended";
+const ENDED_HINT: &str = "Ask the sender for a new QR code to get more files.";
+
+/// The page for a Transfer Link whose Transfer has ended.
+pub(crate) fn render_ended() -> String {
+    let body = dioxus_ssr::render_element(rsx! {
+        main {
+            h1 { "{ENDED}" }
+            p { class: "hint", "{ENDED_HINT}" }
+        }
+    });
+    format!("{HEAD}<body>{body}</body>\n</html>\n")
+}
+
 /// Renders the full page for the open Transfer's Items.
 pub(crate) fn render(items: &[Item]) -> String {
     let body = dioxus_ssr::render_element(rsx! {
@@ -183,6 +206,8 @@ pub(crate) fn render(items: &[Item]) -> String {
     let script = SCRIPT
         .replace("__HINT__", &js_string(HINT))
         .replace("__EMPTY__", &js_string(EMPTY))
-        .replace("__FOLDER__", &js_string(FOLDER));
+        .replace("__FOLDER__", &js_string(FOLDER))
+        .replace("__ENDED__", &js_string(ENDED))
+        .replace("__ENDED_HINT__", &js_string(ENDED_HINT));
     format!("{HEAD}<body>{body}{script}</body>\n</html>\n")
 }

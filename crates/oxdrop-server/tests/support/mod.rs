@@ -6,13 +6,16 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use oxdrop_core::ItemId;
-use oxdrop_server::{BindAddress, EngineConfig, SenderEngine};
+use oxdrop_server::{BindAddress, EngineConfig, ManualClock, SenderEngine};
 
 pub struct Harness {
     pub engine: SenderEngine,
+    /// The engine's clock, which only moves when the test advances it.
+    pub clock: ManualClock,
     pub client: reqwest::Client,
     dir: tempfile::TempDir,
 }
@@ -23,13 +26,21 @@ impl Harness {
         Self::start(EngineConfig {
             bind: BindAddress::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             port: 0,
+            ..EngineConfig::default()
         })
     }
 
+    /// A Sender started with `config`, but always on a manual clock.
     pub fn start(config: EngineConfig) -> Self {
-        let engine = SenderEngine::start(config).expect("engine starts");
+        let clock = ManualClock::new();
+        let engine = SenderEngine::start(EngineConfig {
+            clock: Arc::new(clock.clone()),
+            ..config
+        })
+        .expect("engine starts");
         Self {
             engine,
+            clock,
             client: reqwest::Client::new(),
             dir: tempfile::tempdir().expect("temp dir"),
         }
@@ -126,6 +137,26 @@ impl Events {
 
     async fn next_untimed(&mut self) -> serde_json::Value {
         loop {
+            match self.next_event_untimed().await {
+                Some((event, data)) if event == "transfer" => {
+                    return serde_json::from_str(&data).expect("event data is JSON");
+                }
+                Some(_) => {}
+                None => panic!("event stream closed"),
+            }
+        }
+    }
+
+    /// The next event of any kind, as its name and data, or `None` once the stream
+    /// closes. Fails after a few seconds.
+    pub async fn next_event(&mut self) -> Option<(String, String)> {
+        tokio::time::timeout(Duration::from_secs(5), self.next_event_untimed())
+            .await
+            .expect("timed out waiting for an event")
+    }
+
+    async fn next_event_untimed(&mut self) -> Option<(String, String)> {
+        loop {
             if let Some(end) = self.buffer.find("\n\n") {
                 let block: String = self.buffer.drain(..end + 2).collect();
                 let mut event = None;
@@ -137,17 +168,16 @@ impl Events {
                         data.push_str(chunk.trim_start());
                     }
                 }
-                if event.as_deref() == Some("transfer") {
-                    return serde_json::from_str(&data).expect("event data is JSON");
+                match event {
+                    Some(event) => return Some((event, data)),
+                    None => continue, // a keep-alive comment
                 }
-                continue;
             }
             let chunk = self
                 .response
                 .chunk()
                 .await
-                .expect("event stream readable")
-                .expect("event stream still open");
+                .expect("event stream readable")?;
             self.buffer
                 .push_str(std::str::from_utf8(&chunk).expect("UTF-8 events"));
         }

@@ -29,12 +29,14 @@ impl Share {
     }
 }
 
-/// Passes on bytes `range` of a download, reporting what they mean for each Item they
-/// belong to. An Item's download counts as started once its first bytes go out, ended
+/// Passes on bytes `range` of a download, counting as activity while it streams and
+/// reporting what the bytes mean for each Item they belong to. An Item's download counts as started once its first bytes go out, ended
 /// once its last bytes in `range` do, and cut off if the response stops before that.
 pub(crate) struct Tracked {
     bytes: ByteStream,
     shared: Arc<Shared>,
+    /// The Transfer this response serves, which it is activity for while it streams.
+    generation: u64,
     shares: Vec<Tracking>,
     /// Where the next byte comes from.
     position: u64,
@@ -57,6 +59,7 @@ impl Tracked {
     ) -> Self {
         Self {
             bytes,
+            generation: shared.stream_started(),
             shared,
             shares: shares
                 .into_iter()
@@ -89,7 +92,7 @@ impl Tracked {
             let local = overlap.start - at..overlap.end - at;
             let first = !tracking.started;
             let last = overlap.end == region.end || overlap.end == self.end;
-            self.shared.report(*item, |tracker| {
+            self.shared.report(self.generation, *item, |tracker| {
                 if first {
                     tracker.start(identity, *total, local.start);
                 }
@@ -109,7 +112,9 @@ impl Tracked {
             if tracking.started && !tracking.ended {
                 let identity = &tracking.share.identity;
                 self.shared
-                    .report(tracking.share.item, |tracker| tracker.end(identity, false));
+                    .report(self.generation, tracking.share.item, |tracker| {
+                        tracker.end(identity, false)
+                    });
                 tracking.ended = true;
             }
         }
@@ -126,7 +131,7 @@ impl Tracked {
                 total,
             } = &tracking.share;
             if *total == 0 && !tracking.started && (self.position..=self.end).contains(at) {
-                self.shared.report(*item, |tracker| {
+                self.shared.report(self.generation, *item, |tracker| {
                     tracker.start(identity, 0, 0);
                     tracker.end(identity, true);
                 });
@@ -160,6 +165,7 @@ impl Stream for Tracked {
 
 impl Drop for Tracked {
     fn drop(&mut self) {
+        self.shared.stream_ended(self.generation);
         // The server may stop polling once `Content-Length` bytes are out (or never poll
         // an empty body), so having passed on every byte is enough to be complete.
         if self.finished {
